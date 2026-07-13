@@ -4,70 +4,96 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-直播话术知识库 (Livestream Script Knowledge Base) — a 5-step batch pipeline that transcribes Taobao livestream audio, extracts structured sales-script metadata via DeepSeek, vectorizes the scripts, and serves them through a Streamlit semantic search UI.
+直播话术知识库 (Livestream Script Knowledge Base) — AI 驱动的直播销售话术分析、重写与 SOP 生成系统。主攻长尾市场中小主播群体。
 
-## Prerequisites
+**三线分支架构:**
 
-- Python 3.12+
-- PostgreSQL with pgvector extension installed
-- ffmpeg (for step0 audio download)
-- CUDA-capable GPU optional (Whisper falls back to CPU)
-
-**Before first run**, edit `config.py` and change `CHUNK_DIR` from `/home/justin/audio_chunks` to a path on your machine. Also set environment variables: `DEEPSEEK_API_KEY`, `PG_HOST`, `PG_PORT`, `PG_USER`, `PG_PASSWORD`, `PG_DB`.
+| Branch | Role | Key Files |
+|--------|------|-----------|
+| `main` | 稳定批处理管道 | `step0-4` → `app.py` |
+| `industrial-refactor` | 全内存流式反应堆 | `server_v2.py` + step5 RAG + step6 SOP |
+| `Commercial-version` | SaaS 商用版 | `server_v2.py` + `app_frontend.py` + 卡密 |
 
 ## Commands
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# === Batch 管道 (main branch) ===
+python step0_download.py --url "..." --name "name" --cookie "..."  # 16并发下载
+python step1_transcribe.py               # GPU流式转录 (零磁盘I/O)
+python step2_chunk.py                     # 语义切块
+python step3_deepseek.py [--limit N]     # DeepSeek 四段式富化
+python step4_vectorize.py                 # pgvector 批量入库
+streamlit run app.py                      # 语义搜索UI
 
-# Run the full pipeline (sequential, each step reads the prior step's output)
-python step0_download.py --url "..." --name "主播名_20260712"       # ffmpeg → audio_chunks/*.m4a
-python step0_download.py --batch data/stream_urls.json --duration 3600  # batch mode
-python step1_transcribe.py   # .m4a → data/transcripts/*.vtt (faster-whisper, skips existing)
-python step2_chunk.py        # .vtt → data/chunks.json (500-1000 char chunks)
-python step3_deepseek.py [--limit N]  # chunks.json → data/enriched.json + data/errors.log
-python step4_vectorize.py    # enriched.json → PostgreSQL scripts table + HNSW index
+# === 流式反应堆 (industrial-refactor / Commercial-version) ===
+python server_v2.py                       # FastAPI 异步反应堆
+streamlit run app_frontend.py             # SaaS 前端 (Commercial only)
 
-# Run the search UI
-streamlit run app.py
-
-# Run tests
+# === 测试 ===
 python -m pytest tests/ -v
+python tests/test_memory_leak.py --duration 600  # 内存泄漏检测
 ```
 
 ## Architecture
 
-**Pipeline data flow (file-based intermediate state):**
+See `docs/ARCHITECTURE.md` for full diagrams.
+
+### 流式反应堆 (server_v2.py)
+
 ```
-m3u8/直播URL  →  step0 (ffmpeg download)  →  audio_chunks/*.m4a
-  → step1 (faster-whisper, language=zh)  →  data/transcripts/*.vtt
-  → step2 (char-based chunking at sentence boundaries)  →  data/chunks.json
-  → step3 (DeepSeek async enrichment)  →  data/enriched.json + data/errors.log
-  → step4 (bge embedding + pgvector)  →  PostgreSQL scripts table
-  → app.py (Streamlit)  →  browser
+URL → Worker1 (ffmpeg→numpy) →q→ Worker2 (Whisper GPU) →q→ Worker3 (切块) →q→ Worker4 (DeepSeek)
+                                                                                      │
+                                              POST /api/v1/rewrite ← RAG+SOP ←──────┘
 ```
 
-Each step is an independent script. Intermediate results are persisted to disk, so failed steps can be re-run without redoing earlier work. Step 1 supports resume (skips existing VTT files). Step 3 supports `--limit N` for testing on a subset.
+- **4 Worker 常驻内存**，asyncio.Queue 背压防御 (maxsize=20/50/100/100)
+- **零磁盘 I/O**: ffmpeg stdout → numpy → faster-whisper → 内存 dict
+- **硬件自适应**: 自动检测 GPU VRAM 选最优模型和 batch_size
+- **卡密系统** (Commercial): `card_codes.txt` 热点加载 + `verify_card_code()` 异步校验
+- **user_key 阅后即焚**: 用户的 DeepSeek Key 仅存活在内存任务生命周期中
 
-**Step 3 (DeepSeek enrichment)** is the critical path — uses `asyncio` + `AsyncOpenAI` with a semaphore (configurable via `DEEPSEEK_CONCURRENCY`, default 400) and 3 retries per chunk. Failed chunks are logged to `data/errors.log` with full original text for later debugging. The prompt extracts: refined_script, summary, sales_stage, strategy_types, product_mentions, selling_points, target_audience.
+### Batch 管道 (step0-4)
 
-**Step 4 (vectorization)** uses `BAAI/bge-small-zh-v1.5` via sentence-transformers, with `normalize_embeddings=True`. The schema declares `vector(512)` but the model outputs 384 dimensions — pgvector's `vector(N)` is a max constraint, not fixed. HNSW index with `vector_cosine_ops` (m=16, ef_construction=200). The DB and table are created automatically if absent.
+```
+m3u8 → step0 (16并发下载+ffmpeg合并) → .m4a
+    → step1 (ffmpeg→numpy→whisper) → .vtt
+    → step2 (时间停顿1.5s切块) → chunks.json
+    → step3 (DeepSeek四段式+动态校验) → enriched.json
+    → step4 (流式分批embedding+批量INSERT ON CONFLICT) → pgvector
+    → app.py (Streamlit语义搜索)
+```
 
-**Streamlit app** uses `@st.cache_resource` for the embedding model and DB connection, `@st.cache_data(ttl=300)` for filter dropdowns. Search uses pgvector's cosine distance operator `<=>` with optional faceted filters (source, sales stage, strategy type, product).
+## Configuration
+
+All config in `config.py`. Environment variables:
+
+```bash
+DEEPSEEK_API_KEY="sk-..."    # Step3/4/Server 默认 Key
+PG_HOST="" PG_USER="" PG_DB=""  # PostgreSQL (空字符串=Unix socket)
+HF_ENDPOINT="https://hf-mirror.com"  # 国内镜像
+```
+
+## API Endpoints (server_v2.py)
+
+See `docs/API.md` for full reference.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/v1/analyze?url=...&user_key=...&card_code=...` | 流式分析 |
+| POST | `/api/v1/rewrite?my_product=...&target_style=...&user_key=...&card_code=...` | RAG+SOP |
+| GET | `/api/v1/progress/{id}` | 任务进度 |
+| GET | `/api/v1/health` | 队列状态 |
+
+## Database
+
+PostgreSQL + pgvector. Table `scripts` with JSONB columns + HNSW index. `ON CONFLICT (chunk_id) DO UPDATE` 幂等写入.
 
 ## Key Design Decisions
 
-- **Chinese-language pipeline throughout** (Whisper `language=zh`, bge-small-zh-v1.5, DeepSeek with Chinese prompts)
-- **pgvector over Milvus** (current data volume is small enough)
-- **No real-time ingestion**, no VAD/audio preprocessing, no multi-user/auth
-- **500-1000 character chunking** at sentence boundaries (句末标点 `。！？.!?`), hard-split on oversize entries, short tails merged into previous chunk
-- **JSON arrays stored as JSON strings** in PostgreSQL (`strategy_types`, `product_mentions`, `selling_points`). Faceted filtering uses `LIKE %value%` — this is simple but fragile: substring matches mean "刀" would match "剪刀". Acceptable for current data volume; switch to `jsonb` with `?` / `@>` operators if this causes problems.
-
-## Known Limitations
-
-- `config.CHUNK_DIR` is hardcoded to `/home/justin/audio_chunks` — must be changed per-machine
-- `streamlink` is listed in `requirements.txt` but unused by any pipeline step (only `experiments/test_ytdlp.py` explores alternative download approaches)
-- Step 0 and step 1 are single-file-at-a-time; no parallel processing within each step
-- No incremental update mechanism — re-running step4 re-inserts all records (no upsert/merge)
-- Test coverage is minimal: only step2 chunking logic and step4 DB config presence
+- Chinese-language pipeline throughout
+- pgvector over Milvus (small data volume)
+- `-acodec copy` for merge (秒级), avoid re-encoding
+- JSONB over TEXT for queryable JSON columns
+- `@> ::jsonb` exact matching instead of `LIKE %value%`
+- Semaphore + batch-size for API/memory control
+- `aiofiles` for all async file I/O
