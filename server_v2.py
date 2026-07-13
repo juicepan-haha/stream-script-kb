@@ -49,6 +49,49 @@ task_progress: dict[str, dict] = {}
 
 _SENTENCE_END = re.compile(r"[。！？.!?]$")
 _CHUNK_SECONDS = 30
+
+# =========================================================================
+# 卡密系统（阅后即焚，不落库）
+# =========================================================================
+
+_CARD_CACHE: dict[str, dict] = {}  # code → {expires_at, max_uses, used}
+_CARD_LOCK = asyncio.Lock()
+
+
+def _load_card_codes(path: str = "card_codes.txt") -> None:
+    """从文件加载卡密到内存。"""
+    global _CARD_CACHE
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("|")
+                if len(parts) >= 3:
+                    code = parts[0].strip()
+                    _CARD_CACHE[code] = {
+                        "expires_at": int(parts[1].strip()),
+                        "max_uses": int(parts[2].strip()),
+                        "used": 0,
+                    }
+    except FileNotFoundError:
+        print("[卡密] ⚠️ card_codes.txt 不存在，使用默认测试卡密")
+        _CARD_CACHE["TEST-FREE"] = {"expires_at": 9999999999, "max_uses": 999, "used": 0}
+
+
+async def verify_card_code(code: str) -> bool:
+    """异步校验卡密有效性，更新使用计数。"""
+    async with _CARD_LOCK:
+        if code not in _CARD_CACHE:
+            return False
+        card = _CARD_CACHE[code]
+        if int(time.time()) > card["expires_at"]:
+            return False
+        if card["used"] >= card["max_uses"]:
+            return False
+        card["used"] += 1
+        return True
 _BYTES_PER_CHUNK = _CHUNK_SECONDS * 16000 * 2  # s16le mono 16kHz
 
 
@@ -129,6 +172,7 @@ async def audio_download_and_decode_worker():
                     "audio": samples,
                     "chunk_idx": chunk_idx,
                     "offset_sec": offset_sec,
+                    "user_key": task_data.get("user_key", ""),
                 })
 
                 chunk_idx += 1
@@ -145,6 +189,7 @@ async def audio_download_and_decode_worker():
                 "task_id": task_id,
                 "done": True,
                 "total_chunks": chunk_idx,
+                "user_key": task_data.get("user_key", ""),
             })
 
             stderr_data = await proc.stderr.read()
@@ -225,6 +270,7 @@ async def whisper_transcribe_worker():
                 await chunk_queue.put({
                     "task_id": task_id,
                     "done": True,
+                    "user_key": chunk.get("user_key", ""),
                 })
                 text_queue.task_done()
                 continue
@@ -270,6 +316,7 @@ async def whisper_transcribe_worker():
             await chunk_queue.put({
                 "task_id": task_id,
                 "segments": seg_list,
+                "user_key": chunk.get("user_key", ""),
             })
 
         except Exception as e:
@@ -324,12 +371,18 @@ async def chunking_worker():
 
             if item.get("done"):
                 # 上游结束，清空残片
+                user_key = item.get("user_key", "")
                 if task_id in buffers and buffers[task_id]:
                     chunk = _emit_chunk(task_id, buffers[task_id])
-                    await enriched_queue.put({"task_id": task_id, "chunk": chunk})
+                    await enriched_queue.put({
+                        "task_id": task_id, "chunk": chunk, "user_key": user_key,
+                    })
                     print(f"[Worker 3][切块] [{task_id}] 尾部残片 → {chunk['chunk_id']} "
                           f"({chunk['char_count']} 字)")
-                await enriched_queue.put({"task_id": task_id, "done": True})
+                user_key = item.get("user_key", "")
+                await enriched_queue.put({
+                    "task_id": task_id, "done": True, "user_key": user_key,
+                })
                 task_progress.setdefault(task_id, {})["stage"] = "chunked"
                 buffers.pop(task_id, None)
                 buffer_chars.pop(task_id, None)
@@ -358,6 +411,7 @@ async def chunking_worker():
                         chunk = _emit_chunk(task_id, buffer)
                         await enriched_queue.put({
                             "task_id": task_id, "chunk": chunk,
+                            "user_key": item.get("user_key", ""),
                         })
                         print(f"[Worker 3][切块] [{task_id}] "
                               f"清缓冲区 → {chunk['chunk_id']} ({chunk['char_count']} 字)")
@@ -378,6 +432,7 @@ async def chunking_worker():
                         chunk_indices[task_id] += 1
                         await enriched_queue.put({
                             "task_id": task_id, "chunk": hard_chunk,
+                            "user_key": item.get("user_key", ""),
                         })
                         pos += max_chars
                     continue
@@ -402,6 +457,7 @@ async def chunking_worker():
                     chunk = _emit_chunk(task_id, buffer)
                     await enriched_queue.put({
                         "task_id": task_id, "chunk": chunk,
+                        "user_key": item.get("user_key", ""),
                     })
                     buffer.clear()
                     buffer_chars[task_id] = 0
@@ -457,14 +513,12 @@ def _extract_critical_keywords(text: str) -> list[str]:
 
 async def deepseek_enrich_worker():
     """
-    [Worker 4][DeepSeek] 从 enriched_queue 消费话术 chunk，
-    异步调用 DeepSeek API 做提词器级改造。
+    [Worker 4][DeepSeek] 从 enriched_queue 消费话术 chunk。
+    使用用户的 DeepSeek Key 动态初始化客户端（阅后即焚，不落盘）。
     """
-    client = AsyncOpenAI(
-        api_key=config.DEEPSEEK_API_KEY,
-        base_url=config.DEEPSEEK_BASE_URL,
-    )
     sem = asyncio.Semaphore(config.DEEPSEEK_CONCURRENCY)
+    # 缓存已创建的客户端，避免每个 chunk 都重新初始化
+    client_cache: dict[str, AsyncOpenAI] = {}
 
     print("[Worker 4][DeepSeek] 就绪，等待话术 chunk...")
 
@@ -478,12 +532,23 @@ async def deepseek_enrich_worker():
                 task_progress.setdefault(task_id, {})["stage"] = "completed"
                 print(f"[Worker 4][DeepSeek] [{task_id}] ✅ 全部富化完成 "
                       f"({len(enriched_results.get(task_id, []))} 条)")
+                # 清理该任务的客户端缓存
+                client_cache.pop(task_id, None)
                 enriched_queue.task_done()
                 continue
 
             chunk = item["chunk"]
             text = chunk["text"]
             critical_kw = _extract_critical_keywords(text)
+
+            # 动态获取用户的 DeepSeek Key
+            user_key = item.get("user_key", config.DEEPSEEK_API_KEY)
+            if task_id not in client_cache:
+                client_cache[task_id] = AsyncOpenAI(
+                    api_key=user_key,
+                    base_url=config.DEEPSEEK_BASE_URL,
+                )
+            client = client_cache[task_id]
 
             async with sem:
                 for attempt in range(1, config.DEEPSEEK_RETRIES + 1):
@@ -558,14 +623,35 @@ app = FastAPI(title="AI直播话术流式分析反应堆 (路径B)")
 
 
 @app.post("/api/v1/analyze")
-async def start_analysis(url: str):
-    """前端扔进来一个直播间 URL，异步推入传送带，毫秒级响应。"""
+async def start_analysis(url: str, user_key: str = "", card_code: str = ""):
+    """前端提交：直播间URL + 自带的DeepSeek Key + 本站卡密（阅后即焚）。"""
+    # 1. 卡密校验
+    if not await verify_card_code(card_code):
+        return {
+            "status": "error",
+            "message": "❌ 卡密无效、已被使用或已过期！请前往发卡网购买。",
+        }
+
+    # 2. DeepSeek Key 快速盲测（前端已测，后端再兜底一次）
+    if not user_key or not user_key.startswith("sk-"):
+        return {
+            "status": "error",
+            "message": "❌ DeepSeek API Key 格式无效！请检查您的 Key。",
+        }
+
     task_id = f"task_{int(time.time() * 1000)}"
-    await download_queue.put({"url": url, "task_id": task_id})
+
+    # 3. 任务打包 → 传送带（user_key 仅存活在内存中，阅后即焚）
+    await download_queue.put({
+        "task_id": task_id,
+        "url": url,
+        "user_key": user_key,
+    })
+
     return {
         "status": "accepted",
         "task_id": task_id,
-        "message": "已送入流式传送带，全程无盘化分析中...",
+        "message": "🚀 验证通过！已送入流式反应堆，全自动无盘化分析中...",
     }
 
 
@@ -749,15 +835,26 @@ def _build_rag_context(retrieved: list[dict]) -> str:
 
 
 @app.post("/api/v1/rewrite")
-async def rewrite_script(my_product: str, target_style: str = "呐喊憋单流"):
+async def rewrite_script(
+    my_product: str,
+    target_style: str = "呐喊憋单流",
+    user_key: str = "",
+    card_code: str = "",
+):
     """
-    Step 5: RAG 像素级平替 — 用户输入产品 → 向量检索历史爆款 → DeepSeek 重写脚本。
+    Step 5: RAG 像素级平替 — 用户输入产品 → 向量检索历史爆款 → DeepSeek 重写。
 
     参数:
       my_product: 你要卖的产品（如"多功能不粘锅"）
       target_style: 目标话术风格（如"呐喊憋单流"、"温柔种草流"、"硬核测评流"）
+      user_key: 用户自带的 DeepSeek API Key（阅后即焚）
+      card_code: 本站激活卡密
     """
-    import json as _json
+    # 卡密校验
+    if not await verify_card_code(card_code):
+        return {"status": "error", "message": "❌ 卡密无效或已过期！"}
+    if not user_key or not user_key.startswith("sk-"):
+        return {"status": "error", "message": "❌ DeepSeek API Key 格式无效！"}
 
     print(f"[Step 5][RAG] 检索请求: product={my_product}, style={target_style}")
 
@@ -769,9 +866,9 @@ async def rewrite_script(my_product: str, target_style: str = "呐喊憋单流")
     # 2. 组装 context
     context = _build_rag_context(retrieved)
 
-    # 3. DeepSeek 重写
+    # 3. DeepSeek 重写（使用用户的 Key）
     client = AsyncOpenAI(
-        api_key=config.DEEPSEEK_API_KEY,
+        api_key=user_key,
         base_url=config.DEEPSEEK_BASE_URL,
     )
 
@@ -868,6 +965,8 @@ async def rewrite_script(my_product: str, target_style: str = "呐喊憋单流")
 
 @app.on_event("startup")
 async def startup_event():
+    _load_card_codes()
+    print(f"[卡密] 已加载 {len(_CARD_CACHE)} 个卡密")
     asyncio.create_task(audio_download_and_decode_worker())
     asyncio.create_task(whisper_transcribe_worker())
     asyncio.create_task(chunking_worker())
