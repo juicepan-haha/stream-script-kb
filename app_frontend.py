@@ -17,7 +17,7 @@ st.set_page_config(
     layout="centered",
 )
 
-st.title("🚀 中小主播爆款话术"平替"全自动反应堆")
+st.title('"🚀 中小主播爆款话术"平替"全自动反应堆"')
 st.caption("主攻长尾市场版 — 达到飞书 80% 效果，只需 1% 成本")
 
 st.markdown("---")
@@ -45,7 +45,7 @@ with col1:
             if "URL" in mode else
             "例如：多功能不粘锅"
         ),
-    )
+    ).strip()
 
 with col2:
     target_style = st.selectbox(
@@ -58,19 +58,19 @@ user_key = st.text_input(
     "3. 您的 DeepSeek API Key（本站不储存，阅后即焚）",
     type="password",
     placeholder="sk-...",
-)
+).strip()
 
 card_code = st.text_input(
     "4. 激活卡密（前往发卡网购买，单次仅需几毛钱）",
     placeholder="BETA-TEST-001",
-)
+).strip()
 
 # =========================================================================
 # DeepSeek Key 盲测（锅甩在最前面）
 # =========================================================================
 
-def _test_deepseek_key(key: str) -> bool:
-    """轻量级盲测：用最小的请求验证 Key 是否有效。"""
+def _verify_deepseek_key(key: str) -> tuple[bool, str]:
+    """轻量级盲测 Key 有效性，返回 (成功, 人话提示)。"""
     try:
         resp = requests.post(
             "https://api.deepseek.com/v1/chat/completions",
@@ -85,9 +85,22 @@ def _test_deepseek_key(key: str) -> bool:
             },
             timeout=10,
         )
-        return resp.status_code == 200
-    except Exception:
-        return False
+        if resp.status_code == 200:
+            return True, ""
+        elif resp.status_code == 401:
+            return False, "校验失败：您的 DeepSeek Key 无效，请检查是否复制完整（sk- 开头）。"
+        elif resp.status_code == 429:
+            return False, "访问受限：您的 DeepSeek 账户余额不足或触发频次限制，请充值后重试。"
+        elif resp.status_code >= 500:
+            return False, "DeepSeek 服务器繁忙，请稍后重试。"
+        else:
+            return False, f"DeepSeek 返回异常 (HTTP {resp.status_code})，请稍后重试。"
+    except requests.Timeout:
+        return False, "网络连接超时，请检查网络后重试。"
+    except requests.ConnectionError:
+        return False, "无法连接 DeepSeek 服务器，请检查网络或使用代理。"
+    except Exception as e:
+        return False, f"未知错误: {str(e)[:100]}"
 
 
 # =========================================================================
@@ -99,10 +112,11 @@ if st.button("🔥 开始全自动提炼与脚本重写", type="primary", use_co
     elif not user_key.startswith("sk-"):
         st.error("❌ DeepSeek API Key 格式无效！应以 'sk-' 开头。")
     else:
-        # 1. 盲测 Key
+        # 1. 盲测 Key（优雅人话错误提示）
         with st.spinner("🔄 正在安全校验您的 DeepSeek Key 状态（本站不记录）..."):
-            if not _test_deepseek_key(user_key):
-                st.error("❌ DeepSeek Key 校验失败！请检查 Key 是否正确、余额是否充足。")
+            ok, err_msg = _verify_deepseek_key(user_key)
+            if not ok:
+                st.error(f"❌ {err_msg}")
                 st.stop()
         st.success("✅ DeepSeek Key 验证通过！")
 
@@ -124,8 +138,14 @@ if st.button("🔥 开始全自动提炼与脚本重写", type="primary", use_co
                 except requests.ConnectionError:
                     st.error("❌ 无法连接后端服务！请确认 server_v2.py 已启动。")
                     st.stop()
+                except requests.Timeout:
+                    st.error("⏰ 后端服务响应超时，请稍后重试。")
+                    st.stop()
+                except Exception as e:
+                    st.error(f"❌ 后端通信异常: {str(e)[:200]}")
+                    st.stop()
 
-                if data["status"] == "accepted":
+                if data.get("status") == "accepted":
                     task_id = data["task_id"]
                     st.success(f"✅ {data['message']}")
                     st.info(f"📋 任务 ID: `{task_id}`")
@@ -198,8 +218,11 @@ if st.button("🔥 开始全自动提炼与脚本重写", type="primary", use_co
                 except requests.Timeout:
                     st.error("⏰ 请求超时，请重试。")
                     st.stop()
+                except Exception as e:
+                    st.error(f"❌ 后端通信异常: {str(e)[:200]}")
+                    st.stop()
 
-                if data["status"] == "success":
+                if data.get("status") == "success":
                     st.success("✅ 爆款话术重写完成！")
 
                     # 检索参考
