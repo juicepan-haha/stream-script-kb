@@ -324,6 +324,60 @@ if st.session_state.task_result:
             ]
             st.dataframe(sop_data, use_container_width=True)
 
+    # =====================================================================
+    # 5. 一键导出模块（无需数据库，纯内存生成 TXT）
+    # =====================================================================
+    export_text = ""
+    if result["mode"] == "rewrite":
+        data = result["data"]
+        export_parts = [
+            f"爆款话术脚本 — {data.get('my_product', '')} ({data.get('target_style', '')})",
+            f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            "=" * 50,
+            "",
+            data.get("rewritten_script", ""),
+            "",
+            "=" * 50,
+            "秒级执行 SOP 仪表盘",
+            "=" * 50,
+        ]
+        for step in data.get("sop_timeline", []):
+            export_parts.extend([
+                f"\n[{step.get('time_range', '')}] {step.get('stage', '')}",
+                f"  主播动作: {step.get('host_action', '')}",
+                f"  后台操作: {step.get('operation_action', '')}",
+                f"  关键词: {step.get('verbal_keywords', '')}",
+            ])
+        export_text = "\n".join(export_parts)
+
+    elif result["mode"] == "analyze":
+        results = result.get("results", [])
+        export_parts = [
+            f"直播间话术分析报告 — {st.session_state.url_or_product}",
+            f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"共 {len(results)} 条话术切片",
+            "=" * 50,
+        ]
+        for item in results:
+            export_parts.extend([
+                f"\n━━━ {item.get('chunk_id', '')} ({item.get('char_count', 0)}字) ━━━",
+                f"[破冰留人] {item.get('icebreaker', '')}",
+                f"[痛点植入] {item.get('painpoint', '')}",
+                f"[产品卖点] {item.get('mechanism', '')}",
+                f"[逼单催单] {item.get('close_order', '')}",
+            ])
+        export_text = "\n".join(export_parts)
+
+    if export_text:
+        file_name = f"爆款话术_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        st.download_button(
+            label="📥 一键下载话术文案 (TXT)",
+            data=export_text,
+            file_name=file_name,
+            mime="text/plain",
+            use_container_width=True,
+        )
+
     # 重置按钮
     if st.button("🔄 开始新任务", use_container_width=True):
         for key in ("task_result", "task_error", "is_running",
