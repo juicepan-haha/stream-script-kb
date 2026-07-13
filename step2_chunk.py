@@ -65,8 +65,15 @@ def build_chunks(
     source_file: str,
     min_chars: int = 500,
     max_chars: int = 1000,
+    silence_gap_sec: float = 1.5,
 ) -> list[dict]:
-    """将字幕条目按字数拼接为 chunk。"""
+    """将字幕条目按字数 + 时间停顿联合切分为 chunk。
+
+    切分优先级:
+      1. 单条超 max_chars → 硬切（兜底）
+      2. buffer 超 max_chars → 强制切
+      3. buffer 达 min_chars + (句末标点 或 停顿 >1.5s) → 自然切
+    """
     if not entries:
         return []
 
@@ -76,18 +83,17 @@ def build_chunks(
     chunk_idx = 0
     stem = Path(source_file).stem
 
-    for entry in entries:
+    for i, entry in enumerate(entries):
         text = entry["text"]
         char_count = len(text)
 
-        # 单条超过 max_chars: 先保存 buffer, 然后硬切
+        # --- 单条超限：硬切 ---
         if char_count > max_chars:
             if buffer_entries:
                 chunks.append(_make_chunk(buffer_entries, stem, chunk_idx))
                 chunk_idx += 1
                 buffer_entries = []
                 buffer_chars = 0
-            # 硬切
             pos = 0
             while pos < char_count:
                 seg = text[pos:pos + max_chars]
@@ -106,22 +112,35 @@ def build_chunks(
         buffer_entries.append(entry)
         buffer_chars += char_count
 
-        combined = "".join(e["text"] for e in buffer_entries)
+        # --- 检查是否应该在此处切分 ---
+        should_split = False
+        split_reason = ""
 
-        # 达到 max_chars: 强制切分
         if buffer_chars >= max_chars:
-            chunks.append(_make_chunk(buffer_entries, stem, chunk_idx))
-            chunk_idx += 1
-            buffer_entries = []
-            buffer_chars = 0
-        # 达到 min_chars 且有句末标点: 自然切分
-        elif buffer_chars >= min_chars and _SENTENCE_END.search(combined):
+            # 强制切分（已达上限）
+            should_split = True
+            split_reason = "max_chars"
+        elif buffer_chars >= min_chars:
+            # 自然切分条件 1：句末标点
+            combined = "".join(e["text"] for e in buffer_entries)
+            if _SENTENCE_END.search(combined):
+                should_split = True
+                split_reason = "sentence_end"
+            # 自然切分条件 2：时间停顿（换气/沉默）
+            elif i + 1 < len(entries):
+                next_entry = entries[i + 1]
+                time_gap = next_entry["start"] - entry["end"]
+                if time_gap > silence_gap_sec:
+                    should_split = True
+                    split_reason = f"silence({time_gap:.1f}s)"
+
+        if should_split:
             chunks.append(_make_chunk(buffer_entries, stem, chunk_idx))
             chunk_idx += 1
             buffer_entries = []
             buffer_chars = 0
 
-    # 尾部残片
+    # --- 尾部残片 ---
     if buffer_entries:
         if buffer_chars < min_chars and chunks:
             chunks[-1]["text"] += "".join(e["text"] for e in buffer_entries)
@@ -159,7 +178,10 @@ def main():
         print(f"[STEP2] [{i}/{total}] Processing {source}")
         content = vtt_path.read_text(encoding="utf-8")
         entries = parse_vtt(content)
-        chunks = build_chunks(entries, source, config.MIN_CHARS, config.MAX_CHARS)
+        chunks = build_chunks(
+            entries, source,
+            config.MIN_CHARS, config.MAX_CHARS, config.SILENCE_GAP_SEC,
+        )
         all_chunks.extend(chunks)
         print(
             f"[STEP2] [{i}/{total}] {source} → {len(chunks)} chunks "

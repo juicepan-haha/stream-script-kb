@@ -6,4 +6,5 @@ psycopg2-binary>=2.9.0
 pgvector>=0.3.0
 streamlit>=1.28.0
 numpy>=1.24.0
+aiofiles>=24.0.0
 torch>=2.0.0

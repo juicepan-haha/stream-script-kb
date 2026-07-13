@@ -4,3 +4,11 @@ __pycache__/
 *.pyc
 .DS_Store
 .vscode/
+
+# 数据文件（音频、转录、中间产物）
+audio_chunks/
+data/
+
+# 敏感信息
+cookies.txt
+.env

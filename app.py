@@ -3,6 +3,13 @@
 
 用法: streamlit run app.py
 """
+# ⚠️ 必须在导入 sentence_transformers 之前设置，否则会卡在 HF 网络请求
+import os
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
 import json
 
 import psycopg2
@@ -41,7 +48,7 @@ def get_db_connection():
     return conn
 
 
-# --- 筛选选项 (从 DB 动态获取, 缓存 5 分钟) ---
+# --- 筛选选项（JSONB 原生查询，不再用 LIKE）---
 @st.cache_data(ttl=300)
 def get_filter_options():
     conn = get_db_connection()
@@ -51,44 +58,37 @@ def get_filter_options():
     sources = [r[0] for r in cur.fetchall()]
 
     cur.execute(
-        "SELECT DISTINCT sales_stage FROM scripts WHERE sales_stage != '' ORDER BY sales_stage"
+        "SELECT DISTINCT sales_stage FROM scripts WHERE sales_stage != '' "
+        "ORDER BY sales_stage"
     )
     stages = [r[0] for r in cur.fetchall()]
 
-    # strategy_types 是 JSON 数组, 需要展开去重
-    cur.execute("SELECT DISTINCT strategy_types FROM scripts WHERE strategy_types != '[]'")
-    all_strategies = set()
-    for (val,) in cur.fetchall():
-        try:
-            arr = json.loads(val)
-            all_strategies.update(arr)
-        except json.JSONDecodeError:
-            pass
-    strategies = sorted(all_strategies)
+    # JSONB 原生展开，数据库层面去重
+    cur.execute(
+        "SELECT DISTINCT elem FROM scripts, "
+        "jsonb_array_elements_text(strategy_types) AS elem "
+        "ORDER BY elem"
+    )
+    strategies = [r[0] for r in cur.fetchall()]
 
-    # product_mentions 同样
-    cur.execute("SELECT DISTINCT product_mentions FROM scripts WHERE product_mentions != '[]'")
-    all_products = set()
-    for (val,) in cur.fetchall():
-        try:
-            arr = json.loads(val)
-            all_products.update(arr)
-        except json.JSONDecodeError:
-            pass
-    products = sorted(all_products)
+    cur.execute(
+        "SELECT DISTINCT elem FROM scripts, "
+        "jsonb_array_elements_text(product_mentions) AS elem "
+        "ORDER BY elem"
+    )
+    products = [r[0] for r in cur.fetchall()]
 
     cur.close()
     return sources, stages, strategies, products
 
 
-# --- 渲染 ---
+# --- 渲染筛选栏 ---
 try:
     sources, stages, strategies, products = get_filter_options()
 except Exception:
     st.warning("⚠️ 无法连接数据库。请确认 PostgreSQL 已启动且 step4_vectorize.py 已执行。")
     st.stop()
 
-# 顶部筛选栏
 st.subheader("🔍 筛选条件")
 col1, col2, col3, col4 = st.columns(4)
 with col1:
@@ -109,7 +109,7 @@ query_text = st.text_input(
 top_k = st.slider("返回条数", min_value=5, max_value=100, value=20, step=5)
 
 
-# --- 查询构建 ---
+# --- 查询构建（JSONB @> 精准匹配）---
 def build_where(selected_source, selected_stage, selected_strategy, selected_product):
     conditions = []
     params = []
@@ -120,11 +120,11 @@ def build_where(selected_source, selected_stage, selected_strategy, selected_pro
         conditions.append("sales_stage = %s")
         params.append(selected_stage)
     if selected_strategy != "(全部)":
-        conditions.append("strategy_types LIKE %s")
-        params.append(f"%{selected_strategy}%")
+        conditions.append("strategy_types @> %s::jsonb")
+        params.append(json.dumps([selected_strategy]))
     if selected_product != "(全部)":
-        conditions.append("product_mentions LIKE %s")
-        params.append(f"%{selected_product}%")
+        conditions.append("product_mentions @> %s::jsonb")
+        params.append(json.dumps([selected_product]))
     return (" AND ".join(conditions) if conditions else "TRUE", params)
 
 
@@ -134,6 +134,7 @@ def semantic_search(embedding_str, where_clause, params, top_k):
     query = f"""
         SELECT chunk_id, source_file, sales_stage, strategy_types,
                product_mentions, selling_points, target_audience,
+               icebreaker, painpoint, mechanism, close_order,
                refined_script, summary,
                embedding <=> %s::vector AS distance
         FROM scripts
@@ -146,6 +147,15 @@ def semantic_search(embedding_str, where_clause, params, top_k):
     rows = cur.fetchall()
     cur.close()
     return rows
+
+
+# --- 话术分段渲染 ---
+def _display_script_section(label: str, text: str, emoji: str):
+    """渲染单个话术分段，有内容才显示。"""
+    if not text or not text.strip():
+        return
+    with st.expander(f"{emoji} {label}", expanded=True):
+        st.markdown(text.replace("\n", "<br>"), unsafe_allow_html=True)
 
 
 # --- 搜索按钮 ---
@@ -170,41 +180,24 @@ if search_clicked or query_text:
         st.info("无匹配结果，请调整筛选条件或搜索词。")
     else:
         for row in results:
-            (chunk_id, source_file, stage, strategy_json, product_json,
-             selling_json, audience, refined, summary, distance) = row
+            (chunk_id, source_file, stage, strategy_types, product_mentions,
+             selling_points, audience,
+             icebreaker, painpoint, mechanism, close_order,
+             refined, summary, distance) = row
 
             similarity = max(0.0, 1.0 - float(distance)) if distance is not None else 0.0
 
-            try:
-                strategies_list = (
-                    json.loads(strategy_json)
-                    if isinstance(strategy_json, str)
-                    else strategy_json
-                )
-            except json.JSONDecodeError:
-                strategies_list = []
-            try:
-                products_list = (
-                    json.loads(product_json)
-                    if isinstance(product_json, str)
-                    else product_json
-                )
-            except json.JSONDecodeError:
-                products_list = []
-            try:
-                selling_list = (
-                    json.loads(selling_json)
-                    if isinstance(selling_json, str)
-                    else selling_json
-                )
-            except json.JSONDecodeError:
-                selling_list = []
+            # JSONB 列 psycopg2 直接返回 Python list
+            strategies_list = strategy_types if isinstance(strategy_types, list) else []
+            products_list = product_mentions if isinstance(product_mentions, list) else []
+            selling_list = selling_points if isinstance(selling_points, list) else []
 
             with st.container():
                 st.markdown("---")
+
                 # 标签行
                 tags = [stage] if stage else []
-                tags.extend(strategies_list[:3] if isinstance(strategies_list, list) else [])
+                tags.extend(strategies_list[:3])
                 tag_html = " ".join(
                     f'<span style="background:#e8f0fe;color:#1a73e8;padding:2px 8px;'
                     f'border-radius:4px;font-size:12px;margin-right:4px;">{t}</span>'
@@ -212,12 +205,8 @@ if search_clicked or query_text:
                 )
                 st.markdown(tag_html, unsafe_allow_html=True)
 
-                # 主体文本
-                st.markdown("**📝 话术文本**")
-                st.text(refined if refined else "(无文本)")
-
                 # 元信息
-                mc1, mc2, mc3 = st.columns(3)
+                mc1, mc2, mc3, mc4 = st.columns(4)
                 with mc1:
                     st.caption(f"📎 来源: {source_file}")
                 with mc2:
@@ -225,13 +214,20 @@ if search_clicked or query_text:
                     st.caption(f"🏷️ 品类: {prod_display}")
                 with mc3:
                     st.caption(f"🎯 相似度: {similarity:.3f}")
+                with mc4:
+                    audience_display = audience if audience else "—"
+                    st.caption(f"👥 {audience_display}")
 
                 if summary:
                     st.caption(f"💡 {summary}")
                 if selling_list:
                     st.caption(f"✨ 卖点: {' · '.join(selling_list[:5])}")
-                if audience:
-                    st.caption(f"👥 目标人群: {audience}")
+
+                # 黄金四段式话术展开显示
+                _display_script_section("开场破冰", icebreaker, "🎤")
+                _display_script_section("痛点植入", painpoint, "🎯")
+                _display_script_section("产品卖点", mechanism, "💎")
+                _display_script_section("逼单催单", close_order, "🔥")
 else:
     # 初始状态: 显示统计
     try:
