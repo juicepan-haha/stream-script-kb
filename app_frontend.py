@@ -118,36 +118,94 @@ def _verify_deepseek_key(key: str) -> tuple:
 def show_main_app():
     st.set_page_config(page_title="AI直播话术爆款平替系统", page_icon="🚀", layout="centered")
 
-    # ==================== 🔒 侧边栏：低频隐私配置区 ====================
+    # ==================== 🔒 侧边栏：资产与配置区 ====================
     with st.sidebar:
-        st.header("⚙️ 个人配置中心")
-        st.write(f"当前用户：`{st.session_state.get('user_email', '未登录')}`")
+        st.header("⚙️ 个人中心")
+        st.write(f"👤 账号：`{st.session_state.get('user_email', '未登录')}`")
+
+        # --- 动态拉取用户资产 ---
+        import datetime as _dt
+        uid = st.session_state["user_uuid"]
+        balance = 0
+        is_vip = False
+        vip_until_str = None
+        try:
+            prof = db_supabase.table("user_profiles").select(
+                "balance_count, vip_until"
+            ).eq("id", uid).single().execute().data
+            if prof:
+                balance = prof.get("balance_count", 0)
+                vip_until_str = prof.get("vip_until")
+                if vip_until_str:
+                    vu = _dt.datetime.fromisoformat(
+                        str(vip_until_str).replace("Z", "+00:00")
+                    )
+                    is_vip = vu > _dt.datetime.now(_dt.timezone.utc)
+        except Exception:
+            pass
+
+        # --- 资产看板 ---
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric("📊 剩余额度", f"{balance} 次")
+        with c2:
+            st.metric("👑 会员", "尊贵VIP" if is_vip else "普通用户")
+        if is_vip and vip_until_str:
+            try:
+                vu = _dt.datetime.fromisoformat(
+                    str(vip_until_str).replace("Z", "+00:00")
+                )
+                st.caption(f"📅 有效期至 {vu.strftime('%Y-%m-%d')}")
+            except Exception:
+                pass
+
         st.divider()
 
-        # API Key 锁进侧边栏
+        # --- API Key ---
         st.session_state.api_key = st.text_input(
             "🔑 DeepSeek API Key",
             value=st.session_state.api_key,
             type="password",
             placeholder="sk-... 阅后即焚",
-            help="输入一次后，标签页关闭前无需重复输入。",
             disabled=st.session_state.is_running,
         ).strip()
 
         if st.session_state.api_key:
-            st.caption("🟢 已就绪（暂存内存中）")
+            st.caption("🟢 已就绪（暂存内存）")
         else:
-            st.caption("🔴 请先配置 Key 以解锁功能")
+            st.caption("🔴 请先配置 Key")
 
         st.divider()
 
-        # 卡密
-        st.session_state.card_code = st.text_input(
-            "🎫 激活卡密",
-            value=st.session_state.card_code,
-            placeholder="BETA-TEST-001",
+        # --- 卡密兑换 ---
+        exchange_code = st.text_input(
+            "🎫 兑换卡密 (次数/VIP)",
+            placeholder="输入卡密兑换",
             disabled=st.session_state.is_running,
-        ).strip()
+            key="exchange_code",
+        )
+        if st.button("立即兑换", use_container_width=True,
+                     disabled=st.session_state.is_running):
+            if not exchange_code:
+                st.warning("请输入卡密！")
+            else:
+                try:
+                    resp = requests.post(
+                        "http://127.0.0.1:8000/api/v1/recharge",
+                        params={
+                            "user_id": uid,
+                            "card_code": exchange_code,
+                        }, timeout=10,
+                    )
+                    data = resp.json()
+                    if data.get("status") == "success":
+                        st.success("🎉 兑换成功！资产已更新。")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        st.error(data.get("message", "兑换失败"))
+                except requests.ConnectionError:
+                    st.error("❌ 后端未启动！")
 
         st.divider()
 
@@ -195,14 +253,37 @@ def show_main_app():
         st.session_state.task_result = None
         st.session_state.task_error = None
 
+        # 重新拉取资产（防止过期）
+        uid = st.session_state["user_uuid"]
+        balance = 0
+        is_vip = False
+        try:
+            prof = db_supabase.table("user_profiles").select(
+                "balance_count, vip_until"
+            ).eq("id", uid).single().execute().data
+            if prof:
+                balance = prof.get("balance_count", 0)
+                vu_str = prof.get("vip_until")
+                if vu_str:
+                    import datetime as _dt2
+                    vu = _dt2.datetime.fromisoformat(
+                        str(vu_str).replace("Z", "+00:00")
+                    )
+                    is_vip = vu > _dt2.datetime.now(_dt2.timezone.utc)
+        except Exception:
+            pass
+
+        # 🚨 三条防线
         if not ak or ak.strip() == "":
             st.error("❌ 请先在【左侧边栏】配置您的 DeepSeek API Key！")
+        elif not ak.startswith("sk-"):
+            st.error("❌ Key 格式无效！应以 sk- 开头。")
+        elif not is_vip and balance <= 0:
+            st.error("❌ 免费额度已用尽！请先在【左侧边栏】兑换卡密充值。")
         elif not p:
             st.warning("⚠️ 请输入直播间 URL 或产品名称！")
         elif not cc:
             st.error("❌ 请输入激活卡密！")
-        elif not ak.startswith("sk-"):
-            st.error("❌ Key 格式无效！应以 sk- 开头。")
         else:
             with st.spinner("🔄 校验 Key..."):
                 ok, err = _verify_deepseek_key(ak)
@@ -241,6 +322,7 @@ def show_main_app():
                         params={
                             "task_id": str(tid),
                             "video_url": st.session_state.url_or_product,
+                            "user_id": st.session_state.user_uuid,
                             "user_deepseek_key": st.session_state.api_key,
                             "card_code": st.session_state.card_code,
                         }, timeout=10,

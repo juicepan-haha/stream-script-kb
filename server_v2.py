@@ -696,6 +696,7 @@ app = FastAPI(title="AI直播话术流式分析反应堆 (路径B)")
 async def start_analysis(
     task_id: str,
     video_url: str,
+    user_id: str = "",
     user_deepseek_key: str = "",
     card_code: str = "",
 ):
@@ -709,7 +710,31 @@ async def start_analysis(
     if not user_deepseek_key or not user_deepseek_key.startswith("sk-"):
         return {"status": "error", "message": "❌ DeepSeek API Key 格式无效！"}
 
-    # 2. 立即返回，前端不转圈（BackgroundTasks 管理生命周期）
+    # 2. 后端原子扣减额度（防前端伪造）
+    try:
+        profile = supabase.table("user_profiles").select(
+            "balance_count, vip_until"
+        ).eq("id", user_id).single().execute().data
+
+        is_vip = False
+        if profile and profile.get("vip_until"):
+            from datetime import datetime, timezone
+            vu = datetime.fromisoformat(
+                str(profile["vip_until"]).replace("Z", "+00:00")
+            )
+            is_vip = vu > datetime.now(timezone.utc)
+
+        if not is_vip:
+            cur = profile.get("balance_count", 0)
+            if cur <= 0:
+                return {"status": "error", "message": "❌ 免费额度已用尽！"}
+            supabase.table("user_profiles").update({
+                "balance_count": cur - 1,
+            }).eq("id", user_id).execute()
+    except Exception as e:
+        print(f"[Balance] 额度扣减失败: {e}")
+
+    # 3. 立即返回，前端不转圈（BackgroundTasks 管理生命周期）
     asyncio.create_task(_run_pipeline(
         task_id, video_url, user_deepseek_key,
     ))
@@ -833,6 +858,31 @@ async def get_progress(task_id: str):
         "transcript_segments": len(transcript_results.get(task_id, [])),
         "enriched_chunks": len(enriched_results.get(task_id, [])),
     }
+
+
+@app.post("/api/v1/recharge")
+async def recharge(user_id: str, card_code: str):
+    """卡密兑换：验证卡密 → 增加次数或升级 VIP。"""
+    # 复用卡密系统的验证逻辑
+    valid = await verify_card_code(card_code)
+    if not valid:
+        return {"status": "error", "message": "❌ 卡密无效或已过期！"}
+
+    try:
+        # 简单逻辑：每个有效卡密 +5 次额度
+        prof = supabase.table("user_profiles").select(
+            "balance_count"
+        ).eq("id", user_id).single().execute().data
+
+        new_balance = (prof.get("balance_count", 0) if prof else 0) + 5
+        supabase.table("user_profiles").upsert({
+            "id": user_id,
+            "balance_count": new_balance,
+        }, on_conflict="id").execute()
+
+        return {"status": "success", "message": f"🎉 兑换成功！当前剩余 {new_balance} 次。"}
+    except Exception as e:
+        return {"status": "error", "message": f"充值失败: {str(e)[:200]}"}
 
 
 @app.get("/api/v1/health")
