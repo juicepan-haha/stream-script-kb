@@ -38,54 +38,64 @@ from supabase_client import supabase
 
 class ThrottledProgressUpdater:
     """
-    生产级节流更新器：
-      - 自动节流: 间隔 < min_interval 秒自动跳过
-      - force=True: 绕过节流立刻落库
-      - 终态防御: 一旦写入 success/failed，拒绝任何后续写入（防意外覆盖）
+    工业级节流更新器（数据库条件更新防线）：
+      - 自动节流: 间隔 < min_interval 秒跳过
+      - force=True: 绕过节流立刻尝试写入
+      - DB 级终态锁: WHERE status NOT IN ('success','failed')
+        多进程/Serverless 环境下也不会被竞态覆盖
+      - 应用层 is_terminal 仅作缓存优化，数据源在 DB
     """
 
     def __init__(self, task_id: str, min_interval: float = 5.0):
         self.task_id = task_id
         self.min_interval = min_interval
         self.last_update: float = 0.0
-        self.is_terminal: bool = False
+        self._terminal_cached: bool = False  # 仅缓存，非权威
 
     async def update(self, status: str, detail: str,
                      force: bool = False) -> bool:
         """
-        :param status: 纯状态机值 (processing/success/failed)
-        :param detail: 写入 result_text 的人话日志/JSON/错误提示
-        :param force: True=绕过节流立刻写入
-        :return: True=实际写入了数据库, False=被跳过
+        :return: True=实际写入了数据库, False=被跳过/被DB防线拦截
         """
-        # 1. 终态防御：已写 success/failed 后拒绝任何后续写入
-        if self.is_terminal:
+        # 1. 缓存加速：已知终态直接跳过，省一次网络往返
+        if self._terminal_cached:
             return False
 
         now = time.time()
 
-        # 2. 节流判断: force 或 间隔达标
+        # 2. 节流判断
         if not force and (now - self.last_update < self.min_interval):
             return False
 
         self.last_update = now
 
-        # 3. 标记终态，锁定后续写入
-        if status in ("success", "failed"):
-            self.is_terminal = True
-
-        # 4. 异步丢线程池，不阻塞事件循环
+        # 3. DB 级条件更新：只有当前 status 不是 success/failed 才允许写入
+        #    这是跨进程/跨容器的终极防线，内存 is_terminal 只是缓存
         try:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: supabase.table("fish_box").update({
-                    "status": status,
-                    "result_text": detail[:50000],
-                }).eq("id", self.task_id).execute(),
-            )
+
+            def _do_update():
+                return (
+                    supabase.table("fish_box")
+                    .update({
+                        "status": status,
+                        "result_text": detail[:50000],
+                    })
+                    .eq("id", self.task_id)
+                    .not_.in_("status", ["success", "failed"])
+                    .execute()
+                )
+
+            response = await loop.run_in_executor(None, _do_update)
+
+            # 4. 如果 DB 返回空（已被其他进程锁死），更新缓存
+            if not response.data:
+                self._terminal_cached = True
+                return False
+
             print(f"[Supabase] [{self.task_id}] → {status}")
             return True
+
         except Exception as e:
             print(f"[Supabase] [{self.task_id}] ⚠️ 写入失败: {e}")
             return False
