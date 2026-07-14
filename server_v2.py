@@ -859,27 +859,36 @@ async def get_progress(task_id: str):
 
 @app.post("/api/v1/recharge")
 async def recharge(user_id: str, card_code: str):
-    """卡密兑换：验证卡密 → 增加次数或升级 VIP。"""
-    # 复用卡密系统的验证逻辑
-    valid = await verify_card_code(card_code)
-    if not valid:
-        return {"status": "error", "message": "❌ 卡密无效或已过期！"}
-
+    """原子卡密兑换：排他锁防刷，验证+扣卡密+加额度在 DB 层一个事务完成。"""
     try:
-        # 简单逻辑：每个有效卡密 +5 次额度
-        prof = supabase.table("user_profiles").select(
-            "balance_count"
-        ).eq("id", user_id).single().execute().data
+        # 调用 Supabase RPC（Postgres 函数 atomic_redeem_card）
+        # SELECT FOR UPDATE 排他锁 → 原子扣卡密次数 → 原子加用户额度
+        resp = supabase.rpc(
+            "atomic_redeem_card",
+            {"p_code": card_code, "p_user_id": user_id},
+        ).execute()
 
-        new_balance = (prof.get("balance_count", 0) if prof else 0) + 5
-        supabase.table("user_profiles").upsert({
-            "id": user_id,
-            "balance_count": new_balance,
-        }, on_conflict="id").execute()
+        result = resp.data[0] if resp.data else {}
+        if result.get("success"):
+            return {
+                "status": "success",
+                "message": (
+                    f"🎉 {result.get('message', '兑换成功')}！"
+                    f"（+{result.get('bonus_times', 0)} 次额度"
+                    f"{'，VIP +' + str(result.get('bonus_vip_days', 0)) + '天' if result.get('bonus_vip_days', 0) > 0 else ''}）"
+                ),
+            }
+        else:
+            return {"status": "error", "message": f"❌ {result.get('message', '兑换失败')}"}
 
-        return {"status": "success", "message": f"🎉 兑换成功！当前剩余 {new_balance} 次。"}
     except Exception as e:
-        return {"status": "error", "message": f"充值失败: {str(e)[:200]}"}
+        msg = str(e)
+        if "function" in msg.lower() and "not found" in msg.lower():
+            return {
+                "status": "error",
+                "message": "❌ 兑换系统未初始化！请在Supabase SQL Editor执行 docs/CARD_MIGRATION.sql",
+            }
+        return {"status": "error", "message": f"兑换失败: {msg[:200]}"}
 
 
 @app.get("/api/v1/health")
