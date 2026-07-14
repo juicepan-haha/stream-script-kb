@@ -1102,6 +1102,63 @@ async def rewrite_script(
     }
 
 
+# =========================================================================
+# 超时兜底任务：每隔 5 分钟扫描卡在 processing 超过 10 分钟的任务
+# =========================================================================
+
+_STUCK_TIMEOUT_MIN = 10
+_STUCK_CHECK_INTERVAL = 300  # 5 分钟
+
+
+async def _stuck_task_cleaner():
+    """后台定时任务：将 created_at 超过阈值且仍 processing 的任务标记为 failed。"""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            # 查询所有 processing 状态的任务
+            resp = (
+                supabase.table("fish_box")
+                .select("id, created_at")
+                .eq("status", "processing")
+                .execute()
+            )
+            killed = 0
+            if resp.data:
+                cutoff = time.time() - _STUCK_TIMEOUT_MIN * 60
+                for row in resp.data:
+                    tid = row["id"]
+                    created = row.get("created_at", "")
+                    if created:
+                        # Supabase 返回的是 ISO 8601，手动比大小
+                        try:
+                            from datetime import datetime, timezone
+                            ct = datetime.fromisoformat(
+                                created.replace("Z", "+00:00")
+                            ).timestamp()
+                            if time.time() - ct < _STUCK_TIMEOUT_MIN * 60:
+                                continue  # 还没超时，跳过
+                        except Exception:
+                            pass
+                    # 超时或无法解析 → 杀
+                    supabase.table("fish_box").update({
+                        "status": "failed",
+                        "result_text": (
+                            f"⏰ 任务超时 — 卡在 processing 超过 {_STUCK_TIMEOUT_MIN} "
+                            "分钟，系统已自动重置。请重新发起分析。"
+                        ),
+                    }).eq("id", tid).not_.in_("status", ["success", "failed"]).execute()
+                    killed += 1
+                    print(f"[StuckCleaner] 超时任务 {tid} → failed")
+
+            if killed > 0:
+                print(f"[StuckCleaner] 本轮清理 {killed} 个卡死任务")
+
+        except Exception as e:
+            print(f"[StuckCleaner] ⚠️ 扫描出错: {e}")
+
+        await asyncio.sleep(_STUCK_CHECK_INTERVAL)
+
+
 @app.on_event("startup")
 async def startup_event():
     _load_card_codes()
@@ -1110,7 +1167,8 @@ async def startup_event():
     asyncio.create_task(whisper_transcribe_worker())
     asyncio.create_task(chunking_worker())
     asyncio.create_task(deepseek_enrich_worker())
-    print("🚀 异步反应堆 4 级流水线全部就位！")
+    asyncio.create_task(_stuck_task_cleaner())
+    print("🚀 异步反应堆 4 级流水线 + 超时兜底全部就位！")
 
 
 if __name__ == "__main__":

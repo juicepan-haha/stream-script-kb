@@ -268,8 +268,11 @@ if st.session_state.is_running:
             elif db_status == "queued":
                 st.info(f"🔵 排队中... {db_text}")
 
-            if st.session_state.poll_count > 240:
-                st.session_state.task_error = "⏰ 超时（20 分钟）"
+            if st.session_state.poll_count > 200:
+                st.session_state.task_error = (
+                    "⏰ 检测到云端处理超时（超过 10 分钟）。"
+                    "系统后台已自动重置该任务，请刷新页面或重新发起分析。"
+                )
                 st.session_state.is_running = False
                 st.rerun()
 

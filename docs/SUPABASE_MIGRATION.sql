@@ -14,3 +14,7 @@ ALTER TABLE public.fish_box
 
 -- 3. 已有 NULL status 的行，统一补为 'queued'
 UPDATE public.fish_box SET status = 'queued' WHERE status IS NULL;
+
+-- 4. 确保有 created_at 列（超时检测依赖）
+ALTER TABLE public.fish_box
+  ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
