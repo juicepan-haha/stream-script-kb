@@ -698,15 +698,12 @@ async def start_analysis(
     video_url: str,
     user_id: str = "",
     user_deepseek_key: str = "",
-    card_code: str = "",
 ):
     """
     Supabase 云版接口：前端先在 fish_box INSERT → 获得 task_id，
     然后调用此接口。后端 0ms 返回 queued，后台异步处理。
     """
-    # 1. 卡密校验
-    if not await verify_card_code(card_code):
-        return {"status": "error", "message": "❌ 卡密无效或已过期！"}
+    # 1. 基础校验
     if not user_deepseek_key or not user_deepseek_key.startswith("sk-"):
         return {"status": "error", "message": "❌ DeepSeek API Key 格式无效！"}
 

@@ -282,8 +282,6 @@ def show_main_app():
             st.error("❌ 免费额度已用尽！请先在【左侧边栏】兑换卡密充值。")
         elif not p:
             st.warning("⚠️ 请输入直播间 URL 或产品名称！")
-        elif not cc:
-            st.error("❌ 请输入激活卡密！")
         else:
             with st.spinner("🔄 校验 Key..."):
                 ok, err = _verify_deepseek_key(ak)
@@ -324,7 +322,6 @@ def show_main_app():
                             "video_url": st.session_state.url_or_product,
                             "user_id": st.session_state.user_uuid,
                             "user_deepseek_key": st.session_state.api_key,
-                            "card_code": st.session_state.card_code,
                         }, timeout=10,
                     )
                 except requests.ConnectionError:
