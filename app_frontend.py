@@ -243,6 +243,10 @@ def show_main_app():
             disabled="URL" in mode or st.session_state.is_running,
         )
 
+    # 🚨 按钮变量初始化（防 UnboundLocalError）
+    fire = False
+    rewrite_fire = False
+
     # ---- 双模式切换 ----
     work_mode = st.radio(
         "选择工作模式",
@@ -290,11 +294,10 @@ def show_main_app():
                 placeholder="重点突出防晒防水性能，加入降价促销的逼单口号...",
             )
 
-            if st.button("🪄 一键重写（仅1点，10秒内完成）", use_container_width=True):
+            rewrite_fire = st.button("🪄 一键重写（仅1点，10秒内完成）", use_container_width=True)
+            if rewrite_fire:
                 ak = st.session_state.api_key
                 uid = st.session_state.user_uuid
-
-                # 重新拉余额
                 try:
                     p = db_supabase.table("user_profiles").select(
                         "balance_count"
@@ -340,7 +343,6 @@ def show_main_app():
     if fire:
         p = st.session_state.url_or_product
         ak = st.session_state.api_key
-        cc = st.session_state.card_code
         st.session_state.task_result = None
         st.session_state.task_error = None
 
