@@ -191,122 +191,118 @@ def show_main_app():
                     st.session_state.poll_count = 0
                     st.rerun()
 
-    # ---- 运行态 ----
-    if st.session_state.is_running:
+    # ---- 运行态：提交任务 ----
+    if st.session_state.is_running and st.session_state.running_task_id is None:
         cm = st.session_state.running_mode
-        holder = st.empty()
+        st.markdown("---")
+        with st.spinner("📤 创建任务..."):
+            try:
+                uid = st.session_state["user_uuid"]
+                resp = db_supabase.table("fish_box").insert({
+                    "user_id": uid,
+                    "video_url": st.session_state.url_or_product,
+                    "result_text": "排队中...",
+                }).execute()
+                tid = resp.data[0]["id"]
+                st.session_state.running_task_id = str(tid)
+            except Exception as e:
+                st.session_state.task_error = f"❌ {str(e)[:200]}"
+                st.session_state.is_running = False
+                st.rerun()
 
-        with holder.container():
-            st.markdown("---")
-
-            # 第一步：INSERT Supabase + 调后端
-            if st.session_state.running_task_id is None:
-                with st.spinner("📤 创建任务..."):
-                    try:
-                        uid = st.session_state["user_uuid"]
-                        resp = db_supabase.table("fish_box").insert({
-                            "user_id": uid,
+            if cm == "analyze":
+                try:
+                    requests.post(
+                        "http://127.0.0.1:8000/api/v1/analyze",
+                        params={
+                            "task_id": str(tid),
                             "video_url": st.session_state.url_or_product,
-                            "result_text": "排队中...",
-                        }).execute()
-                        tid = resp.data[0]["id"]
-                        st.session_state.running_task_id = str(tid)
-                    except Exception as e:
-                        st.session_state.task_error = f"❌ {str(e)[:200]}"
-                        st.session_state.is_running = False
-                        st.rerun()
-
-                    if cm == "analyze":
-                        try:
-                            requests.post(
-                                "http://127.0.0.1:8000/api/v1/analyze",
-                                params={
-                                    "task_id": str(tid),
-                                    "video_url": st.session_state.url_or_product,
-                                    "user_deepseek_key": st.session_state.api_key,
-                                    "card_code": st.session_state.card_code,
-                                }, timeout=10,
-                            )
-                        except requests.ConnectionError:
-                            st.session_state.task_error = "❌ 后端未启动！"
-                            st.session_state.is_running = False
-                            st.rerun()
+                            "user_deepseek_key": st.session_state.api_key,
+                            "card_code": st.session_state.card_code,
+                        }, timeout=10,
+                    )
+                except requests.ConnectionError:
+                    st.session_state.task_error = "❌ 后端未启动！"
+                    st.session_state.is_running = False
+                    st.rerun()
+            else:
+                try:
+                    resp = requests.post(
+                        "http://127.0.0.1:8000/api/v1/rewrite",
+                        params={
+                            "my_product": st.session_state.url_or_product,
+                            "target_style": target_style,
+                            "user_key": st.session_state.api_key,
+                            "card_code": st.session_state.card_code,
+                        }, timeout=120,
+                    )
+                    data = resp.json()
+                    if data.get("status") == "success":
+                        st.session_state.task_result = {"mode": "rewrite", "data": data}
                     else:
-                        try:
-                            resp = requests.post(
-                                "http://127.0.0.1:8000/api/v1/rewrite",
-                                params={
-                                    "my_product": st.session_state.url_or_product,
-                                    "target_style": target_style,
-                                    "user_key": st.session_state.api_key,
-                                    "card_code": st.session_state.card_code,
-                                }, timeout=120,
-                            )
-                            data = resp.json()
-                            if data.get("status") == "success":
-                                st.session_state.task_result = {"mode": "rewrite", "data": data}
-                            else:
-                                st.session_state.task_error = data.get("message", "错误")
-                            st.session_state.is_running = False
-                            st.rerun()
-                        except requests.ConnectionError:
-                            st.session_state.task_error = "❌ 后端未启动！"
-                            st.session_state.is_running = False
-                            st.rerun()
+                        st.session_state.task_error = data.get("message", "错误")
+                    st.session_state.is_running = False
+                    st.rerun()
+                except requests.ConnectionError:
+                    st.session_state.task_error = "❌ 后端未启动！"
+                    st.session_state.is_running = False
+                    st.rerun()
 
-            # ---- 轮询 Supabase ----
-            tid = st.session_state.running_task_id
-            if cm == "analyze" and tid:
+        # 提交后刷新一次进入轮询态
+        st.rerun()
+
+    # ---- 轮询态：@st.fragment 局部刷新，不闪烁全页 ----
+    if st.session_state.is_running and st.session_state.running_task_id:
+        task_id = st.session_state.running_task_id
+
+        @st.fragment(run_every=3)
+        def _poll_status():
+            st.markdown("---")
+            try:
+                row = db_supabase.table("fish_box").select(
+                    "status,result_text"
+                ).eq("id", task_id).single().execute().data
+            except Exception:
+                row = {}
+
+            sts = row.get("status", "processing")
+            txt = row.get("result_text", "")
+            badge = {"queued": "🔵", "processing": "🟡", "success": "🟢", "failed": "🔴"}
+            st.subheader(f"{badge.get(sts, '⚪')} 状态: {sts.upper()}")
+
+            if sts == "processing":
+                st.warning("后端正在疯狂榨干服务器...")
+                m = re.match(r"PROGRESS:(\d+)\\|", txt or "")
+                if m:
+                    pct = int(m.group(1)) / 100.0
+                    log = txt[txt.index("|") + 1:]
+                else:
+                    pct = min(0.8, st.session_state.poll_count / 80)
+                    log = txt
+                st.progress(pct, text=f"管道运转中... ({int(pct*100)}%)")
+                st.caption(f"⏱️ {log}")
                 st.session_state.poll_count += 1
 
-                try:
-                    row = db_supabase.table("fish_box").select(
-                        "status,result_text"
-                    ).eq("id", tid).single().execute().data
-                except Exception:
-                    row = {}
-
-                sts = row.get("status", "processing")
-                txt = row.get("result_text", "")
-
-                badge = {"queued": "🔵", "processing": "🟡", "success": "🟢", "failed": "🔴"}
-                st.subheader(f"{badge.get(sts, '⚪')} 状态: {sts.upper()}")
-
-                if sts == "processing":
-                    st.warning("后端正在疯狂榨干服务器...")
-                    m = re.match(r"PROGRESS:(\d+)\\|", txt or "")
-                    if m:
-                        pct = int(m.group(1)) / 100.0
-                        log = txt[txt.index("|") + 1:]
-                    else:
-                        pct = min(0.8, st.session_state.poll_count / 80)
-                        log = txt
-                    st.progress(pct, text=f"管道运转中... ({int(pct*100)}%)")
-                    st.caption(f"⏱️ {log}")
-
-                elif sts == "success":
-                    st.success("🟢 分析成功！")
+            elif sts in ("success", "failed"):
+                # 终态：写入 session_state，跳出轮询
+                if sts == "success":
                     st.session_state.task_result = {"mode": "analyze", "result_text": txt}
-                    st.session_state.is_running = False
-                    st.rerun()
-
-                elif sts == "failed":
-                    st.error(f"🔴 {txt}")
+                else:
                     st.session_state.task_error = txt or "任务失败"
-                    st.session_state.is_running = False
-                    st.rerun()
+                st.session_state.is_running = False
+                st.rerun()  # 最后一次全页重载，渲染最终结果
 
-                elif sts == "queued":
-                    st.info(f"🔵 排队中... {txt}")
+            elif sts == "queued":
+                st.info(f"🔵 排队中... {txt}")
+                st.session_state.poll_count += 1
 
-                if st.session_state.poll_count > 200:
-                    st.session_state.task_error = "⏰ 超时（10分钟），请刷新重试。"
-                    st.session_state.is_running = False
-                    st.rerun()
+            # 超时保底
+            if st.session_state.poll_count > 200:
+                st.session_state.task_error = "⏰ 超时（10分钟），请刷新重试。"
+                st.session_state.is_running = False
+                st.rerun()
 
-        if st.session_state.is_running:
-            time.sleep(3)
-            st.rerun()
+        _poll_status()
 
     # ---- 结果渲染 ----
     if st.session_state.task_error:
