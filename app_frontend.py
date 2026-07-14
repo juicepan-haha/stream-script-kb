@@ -242,9 +242,89 @@ def show_main_app():
             disabled="URL" in mode or st.session_state.is_running,
         )
 
-    # ---- 点火 ----
-    fire = st.button("🔥 开始全自动提炼与脚本重写", type="primary",
-                     use_container_width=True, disabled=st.session_state.is_running)
+    # ---- 双模式切换 ----
+    work_mode = st.radio(
+        "选择工作模式",
+        ["🔥 提炼新视频/直播间", "📚 历史素材库（免消耗点数重写）"],
+        horizontal=True,
+        disabled=st.session_state.is_running,
+    )
+
+    if "📚" in work_mode:
+        # ==================== 模式 B：历史素材库重写 ====================
+        uid = st.session_state["user_uuid"]
+        try:
+            mats = db_supabase.table("user_materials").select(
+                "id, title, tags, video_url, created_at"
+            ).eq("user_id", uid).order("created_at", desc=True).limit(20).execute().data
+        except Exception:
+            mats = []
+
+        if not mats:
+            st.info("💡 您的素材库空空如也，快去「提炼新视频」吧！")
+        else:
+            import datetime as _dt3
+            opts = {
+                m["id"]: (
+                    f"{m['title'][:50]} | "
+                    f"{', '.join(m.get('tags', [])[:3])} | "
+                    f"{m.get('created_at', '')[:10]}"
+                )
+                for m in mats
+            }
+            selected_mat = st.selectbox(
+                "🗂️ 选择历史素材进行免 GPU 重写",
+                options=list(opts.keys()),
+                format_func=lambda x: opts[x],
+            )
+
+            st.divider()
+            st.subheader("✍️ 重写配置")
+            rewrite_style = st.selectbox(
+                "话术风格",
+                ["呐喊憋单流", "温柔种草流", "硬核测评流", "剧情代入流", "快节奏秒杀流"],
+            )
+            custom_prompt = st.text_area(
+                "✍️ 额外要求（选填）",
+                placeholder="重点突出防晒防水性能，加入降价促销的逼单口号...",
+            )
+
+            if st.button("🪄 一键重写（纯文本，10秒内完成）", use_container_width=True):
+                ak = st.session_state.api_key
+                cc = st.session_state.card_code
+                if not ak:
+                    st.error("❌ 请先在侧边栏配置 DeepSeek API Key！")
+                elif not cc:
+                    st.error("❌ 请输入卡密！")
+                else:
+                    with st.spinner("🔄 AI 正在重写中..."):
+                        try:
+                            resp = requests.post(
+                                "http://127.0.0.1:8000/api/v1/rewrite-material",
+                                params={
+                                    "material_id": selected_mat,
+                                    "style": rewrite_style,
+                                    "custom_prompt": custom_prompt,
+                                    "user_key": ak,
+                                    "card_code": cc,
+                                }, timeout=60,
+                            )
+                            data = resp.json()
+                            if data.get("status") == "success":
+                                st.session_state.task_result = {
+                                    "mode": "rewrite", "data": data["data"],
+                                }
+                                st.rerun()
+                            else:
+                                st.error(data.get("message", "重写失败"))
+                        except requests.ConnectionError:
+                            st.error("❌ 后端未启动！")
+    else:
+        # ==================== 模式 A：分析新视频 ====================
+
+        # ---- 点火 ----
+        fire = st.button("🔥 开始全自动提炼与脚本重写", type="primary",
+                         use_container_width=True, disabled=st.session_state.is_running)
 
     if fire:
         p = st.session_state.url_or_product
@@ -294,8 +374,10 @@ def show_main_app():
                     st.session_state.poll_count = 0
                     st.rerun()
 
-    # ---- 运行态：提交任务 ----
-    if st.session_state.is_running and st.session_state.running_task_id is None:
+    # ---- 运行态：提交任务（仅模式 A） ----
+    if work_mode and "📚" in work_mode:
+        pass  # 模式 B 已在上方处理
+    elif st.session_state.is_running and st.session_state.running_task_id is None:
         cm = st.session_state.running_mode
         st.markdown("---")
         with st.spinner("📤 创建任务..."):

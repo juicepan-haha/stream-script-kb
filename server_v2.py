@@ -733,7 +733,7 @@ async def start_analysis(
 
     # 3. 立即返回，前端不转圈（BackgroundTasks 管理生命周期）
     asyncio.create_task(_run_pipeline(
-        task_id, video_url, user_deepseek_key,
+        task_id, video_url, user_deepseek_key, user_id,
     ))
 
     return {"status": "queued", "task_id": task_id}
@@ -743,12 +743,8 @@ async def start_analysis(
 # 管道编排器：分阶段执行 + 节流更新器 + force 最终态
 # =========================================================================
 
-async def _run_pipeline(task_id: str, url: str, user_key: str):
-    """
-    后台协程 — 完整 4 阶段管道。
-    updater.update("processing", ...) 自动节流 >=5 秒，
-    updater.update("success", ..., force=True) 立刻写入最终结果。
-    """
+async def _run_pipeline(task_id: str, url: str, user_key: str, user_id: str = ""):
+    """..."""
     updater = ThrottledProgressUpdater(task_id, min_interval=5.0)
     print(f"[Pipeline] [{task_id}] 启动: {url}")
 
@@ -795,6 +791,27 @@ async def _run_pipeline(task_id: str, url: str, user_key: str):
         if enriched:
             result_json = json.dumps(enriched, ensure_ascii=False, indent=2)
             await updater.update("success", result_json, force=True)
+
+            # 保存到用户素材库（历史重写免 GPU 成本）
+            try:
+                selling_pts = []
+                for item in enriched[:5]:
+                    sp = item.get("selling_points", [])
+                    selling_pts.extend(sp[:3] if isinstance(sp, list) else [])
+                title = (
+                    enriched[0].get("summary", url)[:100]
+                    if enriched else url[:100]
+                )
+                supabase.table("user_materials").insert({
+                    "user_id": user_id,
+                    "title": title,
+                    "tags": selling_pts[:5] if selling_pts else [],
+                    "video_url": url,
+                    "key_selling_points": json.dumps(selling_pts),
+                    "full_script": result_json[:50000],
+                }).execute()
+            except Exception as e:
+                print(f"[Pipeline] [{task_id}] 素材保存失败: {e}")
         else:
             await updater.update("success",
                                  "分析完成，但未提取到有效话术",
@@ -855,6 +872,63 @@ async def get_progress(task_id: str):
         "transcript_segments": len(transcript_results.get(task_id, [])),
         "enriched_chunks": len(enriched_results.get(task_id, [])),
     }
+
+
+@app.post("/api/v1/rewrite-material")
+async def rewrite_material(
+    material_id: int,
+    style: str = "呐喊憋单流",
+    custom_prompt: str = "",
+    user_key: str = "",
+    card_code: str = "",
+):
+    """纯文本快速重写：从历史素材库选一则，换风格重新生成。无 GPU 成本。"""
+    if not await verify_card_code(card_code):
+        return {"status": "error", "message": "❌ 卡密无效！"}
+    if not user_key or not user_key.startswith("sk-"):
+        return {"status": "error", "message": "❌ Key 格式无效！"}
+
+    try:
+        mat = supabase.table("user_materials").select(
+            "title, tags, key_selling_points, full_script, video_url"
+        ).eq("id", material_id).single().execute().data
+        if not mat:
+            return {"status": "error", "message": "素材不存在"}
+    except Exception:
+        return {"status": "error", "message": "素材查询失败"}
+
+    # 用用户自备 Key 调 DeepSeek
+    client = AsyncOpenAI(api_key=user_key, base_url=config.DEEPSEEK_BASE_URL)
+
+    prompt = (
+        f"你是一个直播话术重写专家。"
+        f"请将以下历史话术素材，改写为【{style}】风格的口语脚本。\n"
+        f"{'额外要求：' + custom_prompt if custom_prompt else ''}\n\n"
+        f"原始素材标题: {mat.get('title', '')}\n"
+        f"核心卖点: {mat.get('key_selling_points', '[]')}\n"
+        f"原始脚本:\n{mat.get('full_script', '')[:3000]}"
+    )
+
+    try:
+        resp = await client.chat.completions.create(
+            model=config.DEEPSEEK_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "你是直播带货话术专家。输出一个 json 对象: "
+                    '{"rewritten_script": "...", "sop_timeline": [{"time_range":"...",'
+                    '"stage":"...","host_action":"...","operation_action":"...",'
+                    '"verbal_keywords":"..."}]}'
+                )},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.7, max_tokens=4096,
+            response_format={"type": "json_object"},
+        )
+        content = resp.choices[0].message.content.strip()
+        result = json.loads(content)
+        return {"status": "success", "data": result}
+    except Exception as e:
+        return {"status": "error", "message": f"AI 重写失败: {str(e)[:200]}"}
 
 
 @app.post("/api/v1/recharge")

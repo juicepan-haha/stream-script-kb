@@ -1,5 +1,5 @@
 -- ============================================================
--- Ultimate Cloud Edition — 原子卡密兑换系统
+-- Ultimate Cloud Edition — 原子卡密兑换系统 + 用户素材库
 -- 在 Supabase SQL Editor 中运行
 -- ============================================================
 
@@ -73,3 +73,32 @@ BEGIN
         ('兑换成功！+' || card.bonus_times || ' 次额度')::TEXT;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
+
+
+-- ============================================================
+-- 4. 用户结构化素材库（历史重写免 GPU 成本）
+-- ============================================================
+CREATE TABLE IF NOT EXISTS public.user_materials (
+    id SERIAL PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES auth.users(id),
+    title TEXT DEFAULT '',
+    tags TEXT[] DEFAULT '{}',
+    video_url TEXT DEFAULT '',
+    source_task_id INT DEFAULT NULL,
+    key_selling_points JSONB DEFAULT '[]'::jsonb,
+    full_script TEXT DEFAULT '',
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- RLS
+ALTER TABLE public.user_materials ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can view own materials"
+ON public.user_materials FOR SELECT
+TO authenticated
+USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can insert own materials"
+ON public.user_materials FOR INSERT
+TO authenticated
+WITH CHECK (auth.uid() = user_id);
