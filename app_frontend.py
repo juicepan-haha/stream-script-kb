@@ -147,7 +147,8 @@ def show_main_app():
         # --- 资产看板 ---
         c1, c2 = st.columns(2)
         with c1:
-            st.metric("📊 剩余额度", f"{balance} 次")
+            st.metric("📊 剩余点数", f"{balance} 点")
+            st.caption("提炼新视频: 10点 | 素材重写: 1点")
         with c2:
             st.metric("👑 会员", "尊贵VIP" if is_vip else "普通用户")
         if is_vip and vip_until_str:
@@ -289,13 +290,23 @@ def show_main_app():
                 placeholder="重点突出防晒防水性能，加入降价促销的逼单口号...",
             )
 
-            if st.button("🪄 一键重写（纯文本，10秒内完成）", use_container_width=True):
+            if st.button("🪄 一键重写（仅1点，10秒内完成）", use_container_width=True):
                 ak = st.session_state.api_key
-                cc = st.session_state.card_code
+                uid = st.session_state.user_uuid
+
+                # 重新拉余额
+                try:
+                    p = db_supabase.table("user_profiles").select(
+                        "balance_count"
+                    ).eq("id", uid).single().execute().data
+                    bal = p.get("balance_count", 0) if p else 0
+                except Exception:
+                    bal = 0
+
                 if not ak:
                     st.error("❌ 请先在侧边栏配置 DeepSeek API Key！")
-                elif not cc:
-                    st.error("❌ 请输入卡密！")
+                elif not is_vip and bal < 1:
+                    st.error(f"❌ 点数不足！重写需 1 点，当前 {bal} 点。")
                 else:
                     with st.spinner("🔄 AI 正在重写中..."):
                         try:
@@ -303,10 +314,10 @@ def show_main_app():
                                 "http://127.0.0.1:8000/api/v1/rewrite-material",
                                 params={
                                     "material_id": selected_mat,
+                                    "user_id": uid,
                                     "style": rewrite_style,
                                     "custom_prompt": custom_prompt,
                                     "user_key": ak,
-                                    "card_code": cc,
                                 }, timeout=60,
                             )
                             data = resp.json()
@@ -358,8 +369,8 @@ def show_main_app():
             st.error("❌ 请先在【左侧边栏】配置您的 DeepSeek API Key！")
         elif not ak.startswith("sk-"):
             st.error("❌ Key 格式无效！应以 sk- 开头。")
-        elif not is_vip and balance <= 0:
-            st.error("❌ 免费额度已用尽！请先在【左侧边栏】兑换卡密充值。")
+        elif not is_vip and balance < 10:
+            st.error(f"❌ 点数不足！提炼新视频需 10 点，当前 {balance} 点。请兑换卡密充值。")
         elif not p:
             st.warning("⚠️ 请输入直播间 URL 或产品名称！")
         else:

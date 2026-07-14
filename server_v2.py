@@ -723,10 +723,10 @@ async def start_analysis(
 
         if not is_vip:
             cur = profile.get("balance_count", 0)
-            if cur <= 0:
-                return {"status": "error", "message": "❌ 免费额度已用尽！"}
+            if cur < POINTS_ANALYZE:
+                return {"status": "error", "message": f"❌ 点数不足！需要 {POINTS_ANALYZE} 点，当前 {cur} 点。"}
             supabase.table("user_profiles").update({
-                "balance_count": cur - 1,
+                "balance_count": cur - POINTS_ANALYZE,
             }).eq("id", user_id).execute()
     except Exception as e:
         print(f"[Balance] 额度扣减失败: {e}")
@@ -877,16 +877,34 @@ async def get_progress(task_id: str):
 @app.post("/api/v1/rewrite-material")
 async def rewrite_material(
     material_id: int,
+    user_id: str = "",
     style: str = "呐喊憋单流",
     custom_prompt: str = "",
     user_key: str = "",
-    card_code: str = "",
 ):
     """纯文本快速重写：从历史素材库选一则，换风格重新生成。无 GPU 成本。"""
-    if not await verify_card_code(card_code):
-        return {"status": "error", "message": "❌ 卡密无效！"}
     if not user_key or not user_key.startswith("sk-"):
         return {"status": "error", "message": "❌ Key 格式无效！"}
+
+    # 扣点（VIP 免费）
+    try:
+        prof = supabase.table("user_profiles").select(
+            "balance_count, vip_until"
+        ).eq("id", user_id).single().execute().data
+        is_vip = False
+        if prof and prof.get("vip_until"):
+            from datetime import datetime, timezone as tz
+            vu = datetime.fromisoformat(str(prof["vip_until"]).replace("Z", "+00:00"))
+            is_vip = vu > datetime.now(tz.utc)
+        if not is_vip:
+            cur = prof.get("balance_count", 0) if prof else 0
+            if cur < POINTS_REWRITE:
+                return {"status": "error", "message": f"❌ 点数不足！需要 {POINTS_REWRITE} 点，当前 {cur} 点。"}
+            supabase.table("user_profiles").update({
+                "balance_count": cur - POINTS_REWRITE,
+            }).eq("id", user_id).execute()
+    except Exception as e:
+        return {"status": "error", "message": f"点数校验失败: {str(e)[:100]}"}
 
     try:
         mat = supabase.table("user_materials").select(
@@ -948,7 +966,7 @@ async def recharge(user_id: str, card_code: str):
                 "status": "success",
                 "message": (
                     f"🎉 {result.get('message', '兑换成功')}！"
-                    f"（+{result.get('bonus_times', 0)} 次额度"
+                    f"（+{result.get('bonus_times', 0)} 点"
                     f"{'，VIP +' + str(result.get('bonus_vip_days', 0)) + '天' if result.get('bonus_vip_days', 0) > 0 else ''}）"
                 ),
             }
@@ -1244,6 +1262,10 @@ async def rewrite_script(
 
 _STUCK_TIMEOUT_MIN = 10
 _STUCK_CHECK_INTERVAL = 300  # 5 分钟
+
+# 点数计费
+POINTS_ANALYZE = 10    # 模式 A：提炼新视频（GPU转录+DeepSeek初提炼）
+POINTS_REWRITE = 1     # 模式 B：素材库重写（纯文本DeepSeek，成本低90%）
 
 
 async def _stuck_task_cleaner():

@@ -17,9 +17,9 @@ CREATE TABLE IF NOT EXISTS public.recharge_cards (
 -- 2. 种子卡密（测试用）
 INSERT INTO public.recharge_cards (code, max_uses, bonus_times)
 VALUES
-    ('BETA-TEST-001', 999, 5),
-    ('DEMO-FREE-2026', 50, 5),
-    ('VIP-ALPHA-100', 100, 10)
+    ('BETA-TEST-001', 999, 50),
+    ('DEMO-FREE-2026', 50, 50),
+    ('VIP-ALPHA-100', 100, 100)
 ON CONFLICT (code) DO NOTHING;
 
 -- 3. 原子兑换函数（SELECT FOR UPDATE 排他锁，防无限套现）
