@@ -23,6 +23,10 @@ import json
 import re
 import time
 
+# 自动加载 .env 文件（本地开发用，生产环境用系统环境变量）
+from dotenv import load_dotenv
+load_dotenv()
+
 import numpy as np
 from fastapi import FastAPI
 from openai import AsyncOpenAI
