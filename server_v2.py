@@ -23,47 +23,26 @@ import json
 import re
 import time
 
-# 自动加载 .env 文件（本地开发用，生产环境用系统环境变量）
-from dotenv import load_dotenv
-load_dotenv()
-
 import numpy as np
 from fastapi import FastAPI
 from openai import AsyncOpenAI
-from supabase import create_client, Client as SupabaseClient
 import uvicorn
 
 import config
+from supabase_client import supabase
+
 
 # =========================================================================
-# Supabase 客户端（service_role 绕过 RLS，允许更新任意用户任务行）
+# Supabase 状态写入（引用全局 supabase_client）
 # =========================================================================
-_supabase: SupabaseClient | None = None
-
-
-def _get_supabase() -> SupabaseClient:
-    global _supabase
-    if _supabase is None:
-        if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
-            raise RuntimeError(
-                "SUPABASE_URL 和 SUPABASE_SERVICE_ROLE_KEY 环境变量未设置"
-            )
-        _supabase = create_client(
-            config.SUPABASE_URL,
-            config.SUPABASE_SERVICE_ROLE_KEY,
-        )
-    return _supabase
-
 
 async def _update_task_status(task_id: str, status: str, result_text: str = ""):
     """异步写 Supabase：更新 fish_box 表的状态和结果。"""
     try:
-        sb = _get_supabase()
         update_data = {"status": status}
         if result_text:
-            # 防呆包装：截断过长文本
-            update_data["result_text"] = result_text[:50000]
-        sb.table("fish_box").update(update_data).eq("id", task_id).execute()
+            update_data["result_text"] = result_text[:50000]  # 防呆截断
+        supabase.table("fish_box").update(update_data).eq("id", task_id).execute()
         print(f"[Supabase] [{task_id}] → {status}")
     except Exception as e:
         print(f"[Supabase] [{task_id}] ⚠️ 状态更新失败: {e}")
@@ -1074,14 +1053,6 @@ async def rewrite_script(
 async def startup_event():
     _load_card_codes()
     print(f"[卡密] 已加载 {len(_CARD_CACHE)} 个卡密")
-
-    # Supabase 连接验证
-    try:
-        sb = _get_supabase()
-        print(f"[Supabase] ✅ 已连接: {config.SUPABASE_URL}")
-    except Exception as e:
-        print(f"[Supabase] ⚠️ 未配置或连接失败: {e}")
-
     asyncio.create_task(audio_download_and_decode_worker())
     asyncio.create_task(whisper_transcribe_worker())
     asyncio.create_task(chunking_worker())
