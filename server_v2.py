@@ -26,9 +26,43 @@ import time
 import numpy as np
 from fastapi import FastAPI
 from openai import AsyncOpenAI
+from supabase import create_client, Client as SupabaseClient
 import uvicorn
 
 import config
+
+# =========================================================================
+# Supabase 客户端（service_role 绕过 RLS，允许更新任意用户任务行）
+# =========================================================================
+_supabase: SupabaseClient | None = None
+
+
+def _get_supabase() -> SupabaseClient:
+    global _supabase
+    if _supabase is None:
+        if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
+            raise RuntimeError(
+                "SUPABASE_URL 和 SUPABASE_SERVICE_ROLE_KEY 环境变量未设置"
+            )
+        _supabase = create_client(
+            config.SUPABASE_URL,
+            config.SUPABASE_SERVICE_ROLE_KEY,
+        )
+    return _supabase
+
+
+async def _update_task_status(task_id: str, status: str, result_text: str = ""):
+    """异步写 Supabase：更新 fish_box 表的状态和结果。"""
+    try:
+        sb = _get_supabase()
+        update_data = {"status": status}
+        if result_text:
+            # 防呆包装：截断过长文本
+            update_data["result_text"] = result_text[:50000]
+        sb.table("fish_box").update(update_data).eq("id", task_id).execute()
+        print(f"[Supabase] [{task_id}] → {status}")
+    except Exception as e:
+        print(f"[Supabase] [{task_id}] ⚠️ 状态更新失败: {e}")
 
 # =========================================================================
 # 内存传送带（背压防御：逐级 maxsize）
@@ -623,36 +657,105 @@ app = FastAPI(title="AI直播话术流式分析反应堆 (路径B)")
 
 
 @app.post("/api/v1/analyze")
-async def start_analysis(url: str, user_key: str = "", card_code: str = ""):
-    """前端提交：直播间URL + 自带的DeepSeek Key + 本站卡密（阅后即焚）。"""
+async def start_analysis(
+    task_id: str,
+    video_url: str,
+    user_deepseek_key: str = "",
+    card_code: str = "",
+):
+    """
+    Supabase 云版接口：前端先在 fish_box INSERT → 获得 task_id，
+    然后调用此接口。后端立即返回 queued，后台异步处理。
+    """
     # 1. 卡密校验
     if not await verify_card_code(card_code):
-        return {
-            "status": "error",
-            "message": "❌ 卡密无效、已被使用或已过期！请前往发卡网购买。",
-        }
+        return {"status": "error", "message": "❌ 卡密无效或已过期！"}
+    if not user_deepseek_key or not user_deepseek_key.startswith("sk-"):
+        return {"status": "error", "message": "❌ DeepSeek API Key 格式无效！"}
 
-    # 2. DeepSeek Key 快速盲测（前端已测，后端再兜底一次）
-    if not user_key or not user_key.startswith("sk-"):
-        return {
-            "status": "error",
-            "message": "❌ DeepSeek API Key 格式无效！请检查您的 Key。",
-        }
+    # 2. 立即返回，前端不转圈
+    asyncio.create_task(_process_pipeline_with_supabase(
+        task_id, video_url, user_deepseek_key,
+    ))
 
-    task_id = f"task_{int(time.time() * 1000)}"
+    return {"status": "queued", "task_id": task_id}
 
-    # 3. 任务打包 → 传送带（user_key 仅存活在内存中，阅后即焚）
-    await download_queue.put({
-        "task_id": task_id,
-        "url": url,
-        "user_key": user_key,
-    })
 
-    return {
-        "status": "accepted",
-        "task_id": task_id,
-        "message": "🚀 验证通过！已送入流式反应堆，全自动无盘化分析中...",
-    }
+async def _process_pipeline_with_supabase(
+    task_id: str, url: str, user_key: str,
+):
+    """
+    后台协程：走完整 4 Worker 管道 → 结果写入 Supabase。
+    零阻塞前端，全异常捕获，status 实时落库。
+    """
+    print(f"[Pipeline] [{task_id}] 后台管道启动: {url}")
+
+    try:
+        # --- 状态: processing ---
+        await _update_task_status(task_id, "processing")
+
+        # --- 推入 download_queue，启动管道 ---
+        await download_queue.put({
+            "task_id": task_id,
+            "url": url,
+            "user_key": user_key,
+        })
+
+        # --- 等待管道跑完（轮询 enriched_results + done 信号）---
+        await _wait_for_pipeline_completion(task_id)
+
+        # --- 成功：拼装结果写入 Supabase ---
+        enriched = enriched_results.get(task_id, [])
+        if enriched:
+            result_json = json.dumps(enriched, ensure_ascii=False, indent=2)
+            await _update_task_status(task_id, "success", result_json)
+        else:
+            await _update_task_status(task_id, "success",
+                                       "分析完成，但未提取到有效话术（可能为纯音乐/静音）")
+
+        print(f"[Pipeline] [{task_id}] ✅ 完成 ({len(enriched)} chunks)")
+
+    except Exception as e:
+        # --- 失败：防呆包装，不暴露源码 ---
+        friendly_msg = _wrap_error_for_user(e)
+        await _update_task_status(task_id, "failed", friendly_msg)
+        print(f"[Pipeline] [{task_id}] ❌ 失败: {friendly_msg}")
+
+
+async def _wait_for_pipeline_completion(task_id: str, timeout_min: int = 120):
+    """轮询等待管道处理完成。Worker 4 完成后 stage='completed'。"""
+    deadline = time.time() + timeout_min * 60
+    while time.time() < deadline:
+        stage = task_progress.get(task_id, {}).get("stage", "")
+        if stage == "completed":
+            return
+        # 如果 enriched_results 有数据且队列全空，也视为完成
+        if task_id in enriched_results and enriched_results[task_id]:
+            q_health = download_queue.qsize() + text_queue.qsize() + \
+                       chunk_queue.qsize() + enriched_queue.qsize()
+            if q_health == 0:
+                await asyncio.sleep(5)
+                # 再确认一次
+                if download_queue.qsize() + text_queue.qsize() + \
+                   chunk_queue.qsize() + enriched_queue.qsize() == 0:
+                    return
+        await asyncio.sleep(5)
+    raise TimeoutError(f"管道处理超时 ({timeout_min} 分钟)")
+
+
+def _wrap_error_for_user(e: Exception) -> str:
+    """防呆包装：将 Python 异常转为人话，不暴露源码。"""
+    msg = str(e)
+    if "TimeoutError" in type(e).__name__ or "timeout" in msg.lower():
+        return "任务处理超时，请稍后重试或联系客服。"
+    if "Connection" in type(e).__name__ or "connect" in msg.lower():
+        return "网络连接异常，服务器无法访问直播源。"
+    if "ffmpeg" in msg.lower():
+        return "音频解码失败，直播源可能已失效。"
+    if "CUDA" in msg or "out of memory" in msg.lower():
+        return "服务器 GPU 资源不足，请稍后重试。"
+    # 默认兜底
+    return f"任务处理异常（错误代码: {task_id[-8:]}），请联系客服。"
 
 
 @app.get("/api/v1/transcript/{task_id}")
@@ -967,6 +1070,14 @@ async def rewrite_script(
 async def startup_event():
     _load_card_codes()
     print(f"[卡密] 已加载 {len(_CARD_CACHE)} 个卡密")
+
+    # Supabase 连接验证
+    try:
+        sb = _get_supabase()
+        print(f"[Supabase] ✅ 已连接: {config.SUPABASE_URL}")
+    except Exception as e:
+        print(f"[Supabase] ⚠️ 未配置或连接失败: {e}")
+
     asyncio.create_task(audio_download_and_decode_worker())
     asyncio.create_task(whisper_transcribe_worker())
     asyncio.create_task(chunking_worker())

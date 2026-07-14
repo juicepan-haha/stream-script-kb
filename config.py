@@ -60,3 +60,8 @@ PG_DB = os.environ.get("PG_DB", "stream_scripts")
 # --- Step 5: Streamlit ---
 STREAMLIT_PAGE_SIZE = 20
 STREAMLIT_TITLE = "直播话术知识库"
+
+# --- Supabase (Ultimate Cloud Edition) ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+# service_role key 绕过 RLS，允许后端更新任意用户的 task 行
