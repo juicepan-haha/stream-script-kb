@@ -745,7 +745,7 @@ async def _run_pipeline(task_id: str, url: str, user_key: str):
                 break
             await asyncio.sleep(5)
 
-        # ---- Stage 3 & 4: 富化中，高频调用 updater 自动节流 ----
+        # ---- Stage 3 & 4: 富化中，注入真实进度百分比 ----
         last_report = ""
         while True:
             if task_progress.get(task_id, {}).get("stage") == "completed":
@@ -753,10 +753,16 @@ async def _run_pipeline(task_id: str, url: str, user_key: str):
 
             segs = len(transcript_results.get(task_id, []))
             chunks = len(enriched_results.get(task_id, []))
-            report = f"GPU转录中 (已转录 {segs} 段) | AI提炼中 (已富化 {chunks} 块)"
+
+            # 真·进度：转录段数 → 0-60%，富化块 → 60-95%
+            if segs > 0:
+                pct = min(60, 10 + segs // 20)  # 每 20 段 +1%
+            if chunks > 0:
+                pct = min(95, 60 + chunks * 5)  # 每 1 块 +5%
+
+            report = f"PROGRESS:{pct}|GPU转录中 (已转录 {segs} 段) | AI提炼中 (已富化 {chunks} 块)"
 
             if report != last_report:
-                # 高频调用也没事，updater 内部节流 >=5 秒
                 await updater.update("processing", report)
                 last_report = report
 

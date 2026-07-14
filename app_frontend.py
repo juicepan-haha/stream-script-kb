@@ -162,9 +162,11 @@ if st.session_state.is_running:
             with st.spinner("📤 正在创建任务..."):
                 # 前端 INSERT Supabase（RLS 自动绑定 user_id）
                 try:
+                    # user_deepseek_key 只通过 API 传后端，绝不落库
+                    TEST_USER_UUID = "7b889093-c96a-4348-9157-42d81b2fd284"
                     sb_resp = supabase.table("fish_box").insert({
+                        "user_id": TEST_USER_UUID,
                         "video_url": product,
-                        "user_deepseek_key": api_key,
                         "result_text": "排队中，等待处理...",
                     }).execute()
                     task_id = sb_resp.data[0]["id"] if sb_resp.data else None
@@ -245,11 +247,19 @@ if st.session_state.is_running:
 
             if db_status == "processing":
                 st.warning("后端正在疯狂榨干服务器，请勿关闭网页...")
-                st.caption(f"⏱️ 实时日志: {db_text}")
-                st.progress(
-                    min(0.95, (st.session_state.poll_count % 60) / 60),
-                    text="管道运转中..."
-                )
+
+                # 真·进度条：解析 result_text 中的 PROGRESS:XX| 前缀
+                import re as _re
+                pct_match = _re.match(r"PROGRESS:(\d+)\|", db_text or "")
+                if pct_match:
+                    real_pct = int(pct_match.group(1)) / 100.0
+                    log_text = db_text[db_text.index("|") + 1:]
+                else:
+                    real_pct = min(0.8, st.session_state.poll_count / 80)
+                    log_text = db_text
+
+                st.progress(real_pct, text=f"管道运转中... ({int(real_pct*100)}%)")
+                st.caption(f"⏱️ 实时日志: {log_text}")
 
             elif db_status == "success":
                 st.success("🟢 分析成功！")
