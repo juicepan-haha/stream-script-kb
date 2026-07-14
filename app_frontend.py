@@ -118,22 +118,51 @@ def _verify_deepseek_key(key: str) -> tuple:
 def show_main_app():
     st.set_page_config(page_title="AI直播话术爆款平替系统", page_icon="🚀", layout="centered")
 
-    # 侧边栏
+    # ==================== 🔒 侧边栏：低频隐私配置区 ====================
     with st.sidebar:
-        st.subheader("👤 个人中心")
-        st.write(f"用户：`{st.session_state['user_email']}`")
-        if st.button("退出登录"):
+        st.header("⚙️ 个人配置中心")
+        st.write(f"当前用户：`{st.session_state.get('user_email', '未登录')}`")
+        st.divider()
+
+        # API Key 锁进侧边栏
+        st.session_state.api_key = st.text_input(
+            "🔑 DeepSeek API Key",
+            value=st.session_state.api_key,
+            type="password",
+            placeholder="sk-... 阅后即焚",
+            help="输入一次后，标签页关闭前无需重复输入。",
+            disabled=st.session_state.is_running,
+        ).strip()
+
+        if st.session_state.api_key:
+            st.caption("🟢 已就绪（暂存内存中）")
+        else:
+            st.caption("🔴 请先配置 Key 以解锁功能")
+
+        st.divider()
+
+        # 卡密
+        st.session_state.card_code = st.text_input(
+            "🎫 激活卡密",
+            value=st.session_state.card_code,
+            placeholder="BETA-TEST-001",
+            disabled=st.session_state.is_running,
+        ).strip()
+
+        st.divider()
+
+        if st.button("退出登录", use_container_width=True):
             auth_supabase.auth.sign_out()
             for k in list(st.session_state.keys()):
                 del st.session_state[k]
             st.rerun()
 
-    st.title("🎬 Ultimate Cloud Edition 视频分析控制台")
+    # ==================== 🎬 主页面：极致清爽业务区 ====================
+    st.title("🚀 爆款视频全自动提炼器")
     st.caption("后端 4 级流水线 + Supabase 实时状态流")
 
     st.markdown("---")
 
-    # 模式
     mode = st.radio(
         "选择功能模式",
         ["🎙️ 直播间分析", "✍️ 爆款重写"],
@@ -143,42 +172,37 @@ def show_main_app():
     col1, col2 = st.columns(2)
     with col1:
         st.session_state.url_or_product = st.text_input(
-            "1. 直播间URL 或 产品名称",
+            "直播间URL 或 产品名称",
             value=st.session_state.url_or_product,
             placeholder="https://...m3u8" if "URL" in mode else "例如：多功能不粘锅",
             disabled=st.session_state.is_running,
         ).strip()
     with col2:
         target_style = st.selectbox(
-            "2. 话术风格（仅重写模式）",
+            "话术风格（仅重写模式）",
             ["呐喊憋单流", "温柔种草流", "硬核测评流", "剧情代入流", "快节奏秒杀流"],
             disabled="URL" in mode or st.session_state.is_running,
         )
-
-    st.session_state.api_key = st.text_input(
-        "3. DeepSeek API Key（阅后即焚，绝不落库）",
-        type="password", value=st.session_state.api_key,
-        placeholder="sk-...", disabled=st.session_state.is_running,
-    ).strip()
-
-    st.session_state.card_code = st.text_input(
-        "4. 激活卡密", value=st.session_state.card_code,
-        placeholder="BETA-TEST-001", disabled=st.session_state.is_running,
-    ).strip()
 
     # ---- 点火 ----
     fire = st.button("🔥 开始全自动提炼与脚本重写", type="primary",
                      use_container_width=True, disabled=st.session_state.is_running)
 
     if fire:
-        p, ak, cc = st.session_state.url_or_product, st.session_state.api_key, st.session_state.card_code
+        p = st.session_state.url_or_product
+        ak = st.session_state.api_key
+        cc = st.session_state.card_code
         st.session_state.task_result = None
         st.session_state.task_error = None
 
-        if not p or not ak or not cc:
-            st.error("❌ 请完整填写所有参数！")
+        if not ak or ak.strip() == "":
+            st.error("❌ 请先在【左侧边栏】配置您的 DeepSeek API Key！")
+        elif not p:
+            st.warning("⚠️ 请输入直播间 URL 或产品名称！")
+        elif not cc:
+            st.error("❌ 请输入激活卡密！")
         elif not ak.startswith("sk-"):
-            st.error("❌ Key 格式无效！")
+            st.error("❌ Key 格式无效！应以 sk- 开头。")
         else:
             with st.spinner("🔄 校验 Key..."):
                 ok, err = _verify_deepseek_key(ak)
