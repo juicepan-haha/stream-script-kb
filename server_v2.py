@@ -38,27 +38,43 @@ from supabase_client import supabase
 
 class ThrottledProgressUpdater:
     """
-    优雅节流：常规进度 >=5 秒写一次，成功/失败 force=True 立刻写入。
-    status 永远是纯状态机值，人话日志写入 result_text。
+    生产级节流更新器：
+      - 自动节流: 间隔 < min_interval 秒自动跳过
+      - force=True: 绕过节流立刻落库
+      - 终态防御: 一旦写入 success/failed，拒绝任何后续写入（防意外覆盖）
     """
 
     def __init__(self, task_id: str, min_interval: float = 5.0):
         self.task_id = task_id
         self.min_interval = min_interval
         self.last_update: float = 0.0
+        self.is_terminal: bool = False
 
-    async def update(self, status: str, detail: str, force: bool = False):
+    async def update(self, status: str, detail: str,
+                     force: bool = False) -> bool:
         """
         :param status: 纯状态机值 (processing/success/failed)
-        :param detail: 写入 result_text 的人话日志
-        :param force: True=绕过节流立刻写入 (用于 success/failed 最终态)
+        :param detail: 写入 result_text 的人话日志/JSON/错误提示
+        :param force: True=绕过节流立刻写入
+        :return: True=实际写入了数据库, False=被跳过
         """
+        # 1. 终态防御：已写 success/failed 后拒绝任何后续写入
+        if self.is_terminal:
+            return False
+
         now = time.time()
+
+        # 2. 节流判断: force 或 间隔达标
         if not force and (now - self.last_update < self.min_interval):
-            return  # 节流跳过
+            return False
 
         self.last_update = now
 
+        # 3. 标记终态，锁定后续写入
+        if status in ("success", "failed"):
+            self.is_terminal = True
+
+        # 4. 异步丢线程池，不阻塞事件循环
         try:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
@@ -69,8 +85,10 @@ class ThrottledProgressUpdater:
                 }).eq("id", self.task_id).execute(),
             )
             print(f"[Supabase] [{self.task_id}] → {status}")
+            return True
         except Exception as e:
             print(f"[Supabase] [{self.task_id}] ⚠️ 写入失败: {e}")
+            return False
 
 # =========================================================================
 # 内存传送带（背压防御：逐级 maxsize）
