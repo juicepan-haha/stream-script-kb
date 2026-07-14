@@ -6,9 +6,11 @@ app_frontend.py — 中小主播爆款话术"平替"全自动反应堆 (SaaS 前
 
 防刷新：所有输入和结果通过 st.session_state 持久化。
 """
+import json
 import time
 import requests
 import streamlit as st
+from supabase_client import supabase
 
 # =========================================================================
 # 页面配置
@@ -182,55 +184,86 @@ if fire_clicked or st.session_state.is_running:
                 if current_mode == "analyze":
                     # --- 直播间分析模式：提交 + 轮询 ---
 
-                    # 第一次提交
+                    # 第一次提交：INSERT Supabase → 调用后端
                     if st.session_state.running_task_id is None:
-                        resp = requests.post(
-                            "http://127.0.0.1:8000/api/v1/analyze",
-                            params={
-                                "url": product,
-                                "user_key": api_key,
-                                "card_code": card,
-                            },
-                            timeout=10,
-                        )
-                        data = resp.json()
-                        if data.get("status") != "accepted":
-                            st.session_state.task_error = data.get("message", "未知错误")
+                        # 先写入 Supabase（前端 INSERT，RLS 自动绑定 user_id）
+                        try:
+                            sb_resp = supabase.table("fish_box").insert({
+                                "video_url": product,
+                                "user_deepseek_key": api_key,
+                                "status": "queued",
+                                "result_text": "排队中，等待处理...",
+                            }).execute()
+                            task_id = sb_resp.data[0]["id"] if sb_resp.data else None
+                            if not task_id:
+                                st.session_state.task_error = "❌ 创建任务失败，请重试。"
+                                st.session_state.is_running = False
+                                st.rerun()
+                        except Exception as e:
+                            st.session_state.task_error = f"❌ Supabase 写入失败: {str(e)[:200]}"
                             st.session_state.is_running = False
                             st.rerun()
-                        st.session_state.running_task_id = data["task_id"]
 
-                    # 轮询进度
+                        # 调后端启动管道
+                        try:
+                            resp = requests.post(
+                                "http://127.0.0.1:8000/api/v1/analyze",
+                                params={
+                                    "task_id": str(task_id),
+                                    "video_url": product,
+                                    "user_deepseek_key": api_key,
+                                    "card_code": card,
+                                },
+                                timeout=10,
+                            )
+                            data = resp.json()
+                            if data.get("status") not in ("queued", "accepted"):
+                                st.session_state.task_error = data.get("message", "未知错误")
+                                st.session_state.is_running = False
+                                st.rerun()
+                        except requests.ConnectionError:
+                            st.session_state.task_error = "❌ 后端未启动！请运行 server_v2.py。"
+                            st.session_state.is_running = False
+                            st.rerun()
+
+                        st.session_state.running_task_id = str(task_id)
+
+                    # --- 轮询 Supabase 实时状态 ---
                     task_id = st.session_state.running_task_id
                     st.session_state.poll_count += 1
 
                     try:
-                        prog = requests.get(
-                            f"http://127.0.0.1:8000/api/v1/progress/{task_id}"
-                        ).json()
+                        sb_resp = supabase.table("fish_box").select(
+                            "status, result_text"
+                        ).eq("id", task_id).single().execute()
+                        row = sb_resp.data if sb_resp.data else {}
                     except Exception:
-                        time.sleep(2)
-                        st.rerun()
+                        row = {}
 
-                    stage = prog.get("stage", "unknown")
-                    segs = prog.get("transcript_segments", 0)
-                    chunks = prog.get("enriched_chunks", 0)
+                    db_status = row.get("status", "processing")
+                    db_text = row.get("result_text", "")
 
-                    st.write(f"⏳ 阶段: **{stage}** | 转录段: {segs} | 富化块: {chunks}")
+                    # 状态徽章
+                    badge_color = {
+                        "queued": "🔵", "processing": "🟡",
+                        "success": "🟢", "failed": "🔴",
+                    }
+                    st.write(f"{badge_color.get(db_status, '⚪')} **{db_status.upper()}**")
+                    st.caption(db_text[:300] if db_status == "processing" else "")
 
-                    if stage == "completed":
-                        # 拉取结果
-                        enriched = requests.get(
-                            f"http://127.0.0.1:8000/api/v1/enriched/{task_id}"
-                        ).json()
+                    if db_status == "success":
                         st.session_state.task_result = {
                             "mode": "analyze",
-                            "results": enriched.get("results", []),
+                            "result_text": db_text,
                         }
                         st.session_state.is_running = False
                         st.rerun()
-                    elif st.session_state.poll_count > 120:
-                        st.session_state.task_error = "⏰ 分析超时，请稍后通过任务 ID 查询结果。"
+                    elif db_status == "failed":
+                        st.session_state.task_error = db_text or "任务失败，请重试。"
+                        st.session_state.is_running = False
+                        st.rerun()
+                    elif st.session_state.poll_count > 240:
+                        st.session_state.task_error = "⏰ 分析超时（20 分钟），请稍后重试。"
                         st.session_state.is_running = False
                         st.rerun()
                     else:
@@ -283,14 +316,27 @@ if st.session_state.task_result:
     if result["mode"] == "analyze":
         st.success("✅ 直播间分析完成！")
         st.subheader("📝 富化话术结果")
-        for item in result["results"][:10]:
-            with st.expander(
-                f"{item.get('chunk_id', '')} ({item.get('char_count', 0)} 字)"
-            ):
-                st.markdown("**🎤 破冰:**\n" + item.get("icebreaker", ""))
-                st.markdown("**🎯 痛点:**\n" + item.get("painpoint", ""))
-                st.markdown("**💎 卖点:**\n" + item.get("mechanism", ""))
-                st.markdown("**🔥 逼单:**\n" + item.get("close_order", ""))
+
+        # result_text 是后端塞进来的 JSON 话术，尝试解析
+        result_text = result.get("result_text", "")
+        try:
+            if isinstance(result_text, str):
+                items = json.loads(result_text) if result_text.strip().startswith("[") else []
+            else:
+                items = result_text
+        except (json.JSONDecodeError, TypeError):
+            # 纯文本结果
+            st.markdown(result_text)
+            items = []
+
+        if isinstance(items, list):
+            for item in items[:10]:
+                chunk_id = item.get("chunk_id", f"chunk_{items.index(item)}")
+                with st.expander(f"{chunk_id} ({len(str(item))} 字)"):
+                    st.markdown("**🎤 破冰:**\n" + str(item.get("icebreaker", "")))
+                    st.markdown("**🎯 痛点:**\n" + str(item.get("painpoint", "")))
+                    st.markdown("**💎 卖点:**\n" + str(item.get("mechanism", "")))
+                    st.markdown("**🔥 逼单:**\n" + str(item.get("close_order", "")))
 
     elif result["mode"] == "rewrite":
         data = result["data"]
