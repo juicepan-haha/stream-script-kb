@@ -2,97 +2,98 @@
 """
 app_frontend.py — Ultimate Cloud Edition 前端控制台
 
-Streamlit 轻量级看板，直连 Supabase 3 秒轮询 + 状态徽章实时渲染。
-防刷新：所有输入和结果通过 st.session_state 持久化。
+Supabase Auth 登录/注册 + 3 秒轮询状态渲染。
 """
 import json
+import os
+import re
 import time
 import requests
 import streamlit as st
 
 # =========================================================================
-# Supabase 客户端单例（防轮询时连接数爆炸）
+# Supabase 客户端（anon key 用于 Auth，service_role 用于数据读写）
 # =========================================================================
-@st.cache_resource
-def _get_supabase():
-    from supabase_client import supabase as sb
-    return sb
 
-supabase = _get_supabase()
+@st.cache_resource(ttl=60)  # 60秒过期，防止缓存旧 key
+def _get_clients():
+    from supabase import create_client
+    from dotenv import load_dotenv
+    load_dotenv()
 
-# =========================================================================
-# 页面配置
-# =========================================================================
-st.set_page_config(
-    page_title="AI直播话术爆款平替系统",
-    page_icon="🚀",
-    layout="centered",
-)
+    supabase_url = os.getenv("SUPABASE_URL", "https://wpnaupyqqiiwjbmcucio.supabase.co")
+    anon_key = os.getenv("SUPABASE_ANON_KEY", "")
 
-st.title("🎬 Ultimate Cloud Edition 视频分析控制台")
-st.caption("主攻长尾市场 — 后端 4 级流水线 + Supabase 实时状态流")
+    auth_sb = create_client(supabase_url, anon_key)
+    from supabase_client import supabase as data_sb
+    return auth_sb, data_sb
 
-st.markdown("---")
+auth_supabase, db_supabase = _get_clients()
 
 # =========================================================================
-# 1. 持久化内存初始化
+# Session State 初始化
 # =========================================================================
 _defaults = {
+    "logged_in": False, "user_uuid": None, "user_email": None,
     "api_key": "", "url_or_product": "", "card_code": "",
     "task_result": None, "task_error": None,
     "is_running": False, "running_task_id": None,
     "running_mode": None, "poll_count": 0,
 }
-for key, val in _defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = val
+for k, v in _defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # =========================================================================
-# 2. 输入区域（绑定 session_state，刷新不丢）
+# 登录/注册页面
 # =========================================================================
-mode = st.radio(
-    "选择功能模式",
-    ["🎙️ 直播间分析（URL → 转录 → 话术提炼）",
-     "✍️ 爆款重写（输入产品 → RAG 检索 → SOP 脚本）"],
-    horizontal=True,
-    disabled=st.session_state.is_running,
-)
 
-col1, col2 = st.columns(2)
-with col1:
-    st.session_state.url_or_product = st.text_input(
-        "1. 直播间URL 或 产品名称",
-        value=st.session_state.url_or_product,
-        placeholder=(
-            "https://livenging.alicdn.com/.../merge.m3u8"
-            if "URL" in mode else "例如：多功能不粘锅"
-        ),
-        disabled=st.session_state.is_running,
-    ).strip()
-with col2:
-    target_style = st.selectbox(
-        "2. 目标话术风格（仅爆款重写模式）",
-        ["呐喊憋单流", "温柔种草流", "硬核测评流", "剧情代入流", "快节奏秒杀流"],
-        disabled="URL" in mode or st.session_state.is_running,
-    )
+def show_login_page():
+    st.set_page_config(page_title="Ultimate Cloud Edition - 登录", page_icon="🔐", layout="centered")
+    st.title("🔐 Ultimate Cloud Edition - 用户认证")
 
-st.session_state.api_key = st.text_input(
-    "3. 您的 DeepSeek API Key（本站不储存，阅后即焚）",
-    type="password", value=st.session_state.api_key,
-    placeholder="sk-...", disabled=st.session_state.is_running,
-).strip()
+    tab1, tab2 = st.tabs(["用户登录", "新用户注册"])
 
-st.session_state.card_code = st.text_input(
-    "4. 激活卡密（前往发卡网购买）",
-    value=st.session_state.card_code,
-    placeholder="BETA-TEST-001", disabled=st.session_state.is_running,
-).strip()
+    with tab1:
+        st.subheader("登录到您的账户")
+        login_email = st.text_input("邮箱地址", key="login_email")
+        login_password = st.text_input("密码", type="password", key="login_password")
+
+        if st.button("立即登录", use_container_width=True):
+            try:
+                resp = auth_supabase.auth.sign_in_with_password({
+                    "email": login_email, "password": login_password,
+                })
+                st.session_state["logged_in"] = True
+                st.session_state["user_uuid"] = resp.user.id
+                st.session_state["user_email"] = resp.user.email
+                st.success("🎉 登录成功！")
+                st.rerun()
+            except Exception as e:
+                st.error(f"❌ 登录失败：{str(e)[:200]}")
+
+    with tab2:
+        st.subheader("创建新账户")
+        reg_email = st.text_input("邮箱地址", key="reg_email")
+        reg_password = st.text_input("密码（至少6位）", type="password", key="reg_password")
+
+        if st.button("立即注册", use_container_width=True):
+            try:
+                auth_supabase.auth.sign_up({"email": reg_email, "password": reg_password})
+                st.success("🚀 注册成功！请切换到登录选项卡进行登录。")
+            except Exception as e:
+                st.error(f"❌ 注册失败：{str(e)[:200]}")
+
+    # 用户已登录自动跳过
+    if st.session_state.get("logged_in") and st.session_state.get("user_uuid"):
+        st.rerun()
 
 
 # =========================================================================
-# 3. DeepSeek Key 盲测
+# Key 盲测
 # =========================================================================
-def _verify_deepseek_key(key: str) -> tuple[bool, str]:
+
+def _verify_deepseek_key(key: str) -> tuple:
     try:
         resp = requests.post(
             "https://api.deepseek.com/v1/chat/completions",
@@ -101,279 +102,282 @@ def _verify_deepseek_key(key: str) -> tuple[bool, str]:
             timeout=10,
         )
         if resp.status_code == 200:   return True, ""
-        if resp.status_code == 401:   return False, "Key 无效，请检查是否复制完整（sk- 开头）。"
+        if resp.status_code == 401:   return False, "Key 无效，请检查是否复制完整。"
         if resp.status_code == 429:   return False, "余额不足或频次限制，请充值后重试。"
-        if resp.status_code >= 500:   return False, "DeepSeek 服务器繁忙，请稍后重试。"
-        return False, f"DeepSeek 返回异常 (HTTP {resp.status_code})，请稍后重试。"
-    except requests.Timeout:          return False, "网络超时，请检查网络。"
-    except requests.ConnectionError:   return False, "无法连接 DeepSeek，请检查网络或代理。"
-    except Exception as e:            return False, f"未知错误: {str(e)[:100]}"
+        if resp.status_code >= 500:   return False, "DeepSeek 服务器繁忙。"
+        return False, f"DeepSeek 异常 (HTTP {resp.status_code})"
+    except requests.Timeout:          return False, "网络超时。"
+    except requests.ConnectionError:   return False, "无法连接 DeepSeek。"
+    except Exception as e:            return False, f"错误: {str(e)[:100]}"[:100]
 
 
 # =========================================================================
-# 4. 业务点火
+# 主业务控制台
 # =========================================================================
-fire_clicked = st.button(
-    "🔥 开始全自动提炼与脚本重写", type="primary",
-    use_container_width=True, disabled=st.session_state.is_running,
-)
 
-if fire_clicked:
-    product = st.session_state.url_or_product
-    api_key = st.session_state.api_key
-    card = st.session_state.card_code
+def show_main_app():
+    st.set_page_config(page_title="AI直播话术爆款平替系统", page_icon="🚀", layout="centered")
 
-    st.session_state.task_result = None
-    st.session_state.task_error = None
+    # 侧边栏
+    with st.sidebar:
+        st.subheader("👤 个人中心")
+        st.write(f"用户：`{st.session_state['user_email']}`")
+        if st.button("退出登录"):
+            auth_supabase.auth.sign_out()
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
 
-    if not product or not api_key or not card:
-        st.error("❌ 请完整填写以上所有参数！")
-    elif not api_key.startswith("sk-"):
-        st.error("❌ DeepSeek API Key 格式无效！应以 'sk-' 开头。")
-    else:
-        with st.spinner("🔄 正在校验 DeepSeek Key..."):
-            ok, err_msg = _verify_deepseek_key(api_key)
-            if not ok:
-                st.error(f"❌ {err_msg}")
-            else:
-                st.success("✅ DeepSeek Key 验证通过！")
-                st.session_state.is_running = True
-                st.session_state.running_mode = "analyze" if "URL" in mode else "rewrite"
-                st.session_state.poll_count = 0
-                st.rerun()
+    st.title("🎬 Ultimate Cloud Edition 视频分析控制台")
+    st.caption("后端 4 级流水线 + Supabase 实时状态流")
 
-# =========================================================================
-# 5. 运行态：轮询 + 状态渲染
-# =========================================================================
-if st.session_state.is_running:
-    current_mode = st.session_state.running_mode
-    product = st.session_state.url_or_product
-    api_key = st.session_state.api_key
-    card = st.session_state.card_code
+    st.markdown("---")
 
-    # --- 用 st.empty() 局部刷新，避免整页闪烁 ---
-    status_holder = st.empty()
+    # 模式
+    mode = st.radio(
+        "选择功能模式",
+        ["🎙️ 直播间分析", "✍️ 爆款重写"],
+        horizontal=True, disabled=st.session_state.is_running,
+    )
 
-    with status_holder.container():
-        st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.session_state.url_or_product = st.text_input(
+            "1. 直播间URL 或 产品名称",
+            value=st.session_state.url_or_product,
+            placeholder="https://...m3u8" if "URL" in mode else "例如：多功能不粘锅",
+            disabled=st.session_state.is_running,
+        ).strip()
+    with col2:
+        target_style = st.selectbox(
+            "2. 话术风格（仅重写模式）",
+            ["呐喊憋单流", "温柔种草流", "硬核测评流", "剧情代入流", "快节奏秒杀流"],
+            disabled="URL" in mode or st.session_state.is_running,
+        )
 
-        # 第一步提交
-        if st.session_state.running_task_id is None:
-            with st.spinner("📤 正在创建任务..."):
-                # 前端 INSERT Supabase（RLS 自动绑定 user_id）
-                try:
-                    # user_deepseek_key 只通过 API 传后端，绝不落库
-                    TEST_USER_UUID = "7b889093-c96a-4348-9157-42d81b2fd284"
-                    sb_resp = supabase.table("fish_box").insert({
-                        "user_id": TEST_USER_UUID,
-                        "video_url": product,
-                        "result_text": "排队中，等待处理...",
-                    }).execute()
-                    task_id = sb_resp.data[0]["id"] if sb_resp.data else None
-                    if not task_id:
-                        st.session_state.task_error = "❌ 任务创建失败"
+    st.session_state.api_key = st.text_input(
+        "3. DeepSeek API Key（阅后即焚，绝不落库）",
+        type="password", value=st.session_state.api_key,
+        placeholder="sk-...", disabled=st.session_state.is_running,
+    ).strip()
+
+    st.session_state.card_code = st.text_input(
+        "4. 激活卡密", value=st.session_state.card_code,
+        placeholder="BETA-TEST-001", disabled=st.session_state.is_running,
+    ).strip()
+
+    # ---- 点火 ----
+    fire = st.button("🔥 开始全自动提炼与脚本重写", type="primary",
+                     use_container_width=True, disabled=st.session_state.is_running)
+
+    if fire:
+        p, ak, cc = st.session_state.url_or_product, st.session_state.api_key, st.session_state.card_code
+        st.session_state.task_result = None
+        st.session_state.task_error = None
+
+        if not p or not ak or not cc:
+            st.error("❌ 请完整填写所有参数！")
+        elif not ak.startswith("sk-"):
+            st.error("❌ Key 格式无效！")
+        else:
+            with st.spinner("🔄 校验 Key..."):
+                ok, err = _verify_deepseek_key(ak)
+                if not ok:
+                    st.error(f"❌ {err}")
+                else:
+                    st.success("✅ 验证通过！")
+                    st.session_state.is_running = True
+                    st.session_state.running_mode = "analyze" if "URL" in mode else "rewrite"
+                    st.session_state.poll_count = 0
+                    st.rerun()
+
+    # ---- 运行态 ----
+    if st.session_state.is_running:
+        cm = st.session_state.running_mode
+        holder = st.empty()
+
+        with holder.container():
+            st.markdown("---")
+
+            # 第一步：INSERT Supabase + 调后端
+            if st.session_state.running_task_id is None:
+                with st.spinner("📤 创建任务..."):
+                    try:
+                        uid = st.session_state["user_uuid"]
+                        resp = db_supabase.table("fish_box").insert({
+                            "user_id": uid,
+                            "video_url": st.session_state.url_or_product,
+                            "result_text": "排队中...",
+                        }).execute()
+                        tid = resp.data[0]["id"]
+                        st.session_state.running_task_id = str(tid)
+                    except Exception as e:
+                        st.session_state.task_error = f"❌ {str(e)[:200]}"
                         st.session_state.is_running = False
                         st.rerun()
-                except Exception as e:
-                    st.session_state.task_error = f"❌ Supabase: {str(e)[:200]}"
+
+                    if cm == "analyze":
+                        try:
+                            requests.post(
+                                "http://127.0.0.1:8000/api/v1/analyze",
+                                params={
+                                    "task_id": str(tid),
+                                    "video_url": st.session_state.url_or_product,
+                                    "user_deepseek_key": st.session_state.api_key,
+                                    "card_code": st.session_state.card_code,
+                                }, timeout=10,
+                            )
+                        except requests.ConnectionError:
+                            st.session_state.task_error = "❌ 后端未启动！"
+                            st.session_state.is_running = False
+                            st.rerun()
+                    else:
+                        try:
+                            resp = requests.post(
+                                "http://127.0.0.1:8000/api/v1/rewrite",
+                                params={
+                                    "my_product": st.session_state.url_or_product,
+                                    "target_style": target_style,
+                                    "user_key": st.session_state.api_key,
+                                    "card_code": st.session_state.card_code,
+                                }, timeout=120,
+                            )
+                            data = resp.json()
+                            if data.get("status") == "success":
+                                st.session_state.task_result = {"mode": "rewrite", "data": data}
+                            else:
+                                st.session_state.task_error = data.get("message", "错误")
+                            st.session_state.is_running = False
+                            st.rerun()
+                        except requests.ConnectionError:
+                            st.session_state.task_error = "❌ 后端未启动！"
+                            st.session_state.is_running = False
+                            st.rerun()
+
+            # ---- 轮询 Supabase ----
+            tid = st.session_state.running_task_id
+            if cm == "analyze" and tid:
+                st.session_state.poll_count += 1
+
+                try:
+                    row = db_supabase.table("fish_box").select(
+                        "status,result_text"
+                    ).eq("id", tid).single().execute().data
+                except Exception:
+                    row = {}
+
+                sts = row.get("status", "processing")
+                txt = row.get("result_text", "")
+
+                badge = {"queued": "🔵", "processing": "🟡", "success": "🟢", "failed": "🔴"}
+                st.subheader(f"{badge.get(sts, '⚪')} 状态: {sts.upper()}")
+
+                if sts == "processing":
+                    st.warning("后端正在疯狂榨干服务器...")
+                    m = re.match(r"PROGRESS:(\d+)\\|", txt or "")
+                    if m:
+                        pct = int(m.group(1)) / 100.0
+                        log = txt[txt.index("|") + 1:]
+                    else:
+                        pct = min(0.8, st.session_state.poll_count / 80)
+                        log = txt
+                    st.progress(pct, text=f"管道运转中... ({int(pct*100)}%)")
+                    st.caption(f"⏱️ {log}")
+
+                elif sts == "success":
+                    st.success("🟢 分析成功！")
+                    st.session_state.task_result = {"mode": "analyze", "result_text": txt}
                     st.session_state.is_running = False
                     st.rerun()
 
-                st.session_state.running_task_id = str(task_id)
+                elif sts == "failed":
+                    st.error(f"🔴 {txt}")
+                    st.session_state.task_error = txt or "任务失败"
+                    st.session_state.is_running = False
+                    st.rerun()
 
-                # 调后端启动管道
-                if current_mode == "analyze":
-                    try:
-                        resp = requests.post(
-                            "http://127.0.0.1:8000/api/v1/analyze",
-                            params={
-                                "task_id": str(task_id), "video_url": product,
-                                "user_deepseek_key": api_key, "card_code": card,
-                            }, timeout=10,
-                        )
-                        data = resp.json()
-                        if data.get("status") not in ("queued", "accepted"):
-                            st.session_state.task_error = data.get("message", "错误")
-                            st.session_state.is_running = False
-                            st.rerun()
-                    except requests.ConnectionError:
-                        st.session_state.task_error = "❌ 后端未启动！请运行 server_v2.py。"
-                        st.session_state.is_running = False
-                        st.rerun()
+                elif sts == "queued":
+                    st.info(f"🔵 排队中... {txt}")
 
-                elif current_mode == "rewrite":
-                    try:
-                        resp = requests.post(
-                            "http://127.0.0.1:8000/api/v1/rewrite",
-                            params={
-                                "my_product": product, "target_style": target_style,
-                                "user_key": api_key, "card_code": card,
-                            }, timeout=120,
-                        )
-                        data = resp.json()
-                        if data.get("status") == "success":
-                            st.session_state.task_result = {
-                                "mode": "rewrite", "data": data,
-                            }
-                        else:
-                            st.session_state.task_error = data.get("message", "错误")
-                        st.session_state.is_running = False
-                        st.rerun()
-                    except requests.ConnectionError:
-                        st.session_state.task_error = "❌ 后端未启动！"
-                        st.session_state.is_running = False
-                        st.rerun()
+                if st.session_state.poll_count > 200:
+                    st.session_state.task_error = "⏰ 超时（10分钟），请刷新重试。"
+                    st.session_state.is_running = False
+                    st.rerun()
 
-        # --- 轮询 Supabase 状态 ---
-        task_id = st.session_state.running_task_id
+        if st.session_state.is_running:
+            time.sleep(3)
+            st.rerun()
 
-        if current_mode == "analyze" and task_id:
-            st.session_state.poll_count += 1
+    # ---- 结果渲染 ----
+    if st.session_state.task_error:
+        st.error(st.session_state.task_error)
 
+    if st.session_state.task_result:
+        r = st.session_state.task_result
+        st.markdown("---")
+
+        if r["mode"] == "analyze":
+            st.success("✅ 分析完成！")
+            st.subheader("📝 富化话术")
+            txt = r.get("result_text", "")
             try:
-                sb_resp = supabase.table("fish_box").select(
-                    "status, result_text"
-                ).eq("id", task_id).single().execute()
-                row = sb_resp.data if sb_resp.data else {}
+                items = json.loads(txt) if txt.strip().startswith("[") else []
             except Exception:
-                row = {}
+                st.markdown(txt); items = []
+            if isinstance(items, list):
+                for it in items[:10]:
+                    with st.expander(it.get("chunk_id", f"chunk_{id(it)}")):
+                        st.markdown("🎤 " + str(it.get("icebreaker", "")))
+                        st.markdown("🎯 " + str(it.get("painpoint", "")))
+                        st.markdown("💎 " + str(it.get("mechanism", "")))
+                        st.markdown("🔥 " + str(it.get("close_order", "")))
 
-            db_status = row.get("status", "processing")
-            db_text = row.get("result_text", "")
+        elif r["mode"] == "rewrite":
+            d = r["data"]
+            st.success("✅ 重写完成！")
+            if d.get("retrieved_references"):
+                st.subheader("📚 历史爆款参考")
+                rcols = st.columns(len(d["retrieved_references"]))
+                for i, ref in enumerate(d["retrieved_references"]):
+                    with rcols[i]:
+                        st.metric(f"#{i+1}", f"{ref['similarity']*100:.0f}%")
+            st.subheader("📝 话术脚本")
+            st.markdown(d.get("rewritten_script", "").replace("[", "\n\n**[").replace("]", "]** "))
+            sop = d.get("sop_timeline", [])
+            if sop:
+                st.subheader("⏱️ SOP 仪表盘")
+                st.dataframe([{
+                    "时间": s.get("time_range",""), "阶段": s.get("stage",""),
+                    "主播": s.get("host_action",""), "操作": s.get("operation_action",""),
+                    "关键词": s.get("verbal_keywords",""),
+                } for s in sop], use_container_width=True)
 
-            # 状态徽章
-            badge = {"queued": "🔵", "processing": "🟡", "success": "🟢", "failed": "🔴"}
-            st.subheader(f"{badge.get(db_status, '⚪')} 状态: {db_status.upper()}")
+        # 导出
+        ext = ""
+        if r["mode"] == "rewrite":
+            ext = r["data"].get("rewritten_script", "")
+        elif r["mode"] == "analyze":
+            ext = r.get("result_text", "")
+        if ext:
+            st.download_button("📥 一键下载 TXT", data=ext,
+                               file_name=f"话术_{time.strftime('%Y%m%d_%H%M%S')}.txt",
+                               mime="text/plain", use_container_width=True)
 
-            if db_status == "processing":
-                st.warning("后端正在疯狂榨干服务器，请勿关闭网页...")
+        if st.button("🔄 开始新任务", use_container_width=True):
+            for k in ("task_result", "task_error", "is_running",
+                      "running_task_id", "running_mode", "poll_count"):
+                st.session_state[k] = None if k in ("task_result","task_error",
+                    "running_task_id","running_mode") else (False if k=="is_running" else 0)
+            st.rerun()
 
-                # 真·进度条：解析 result_text 中的 PROGRESS:XX| 前缀
-                import re as _re
-                pct_match = _re.match(r"PROGRESS:(\d+)\|", db_text or "")
-                if pct_match:
-                    real_pct = int(pct_match.group(1)) / 100.0
-                    log_text = db_text[db_text.index("|") + 1:]
-                else:
-                    real_pct = min(0.8, st.session_state.poll_count / 80)
-                    log_text = db_text
-
-                st.progress(real_pct, text=f"管道运转中... ({int(real_pct*100)}%)")
-                st.caption(f"⏱️ 实时日志: {log_text}")
-
-            elif db_status == "success":
-                st.success("🟢 分析成功！")
-                st.session_state.task_result = {
-                    "mode": "analyze", "result_text": db_text,
-                }
-                st.session_state.is_running = False
-                st.rerun()
-
-            elif db_status == "failed":
-                st.error(f"🔴 任务失败: {db_text}")
-                st.session_state.task_error = db_text or "未知错误"
-                st.session_state.is_running = False
-                st.rerun()
-
-            elif db_status == "queued":
-                st.info(f"🔵 排队中... {db_text}")
-
-            if st.session_state.poll_count > 200:
-                st.session_state.task_error = (
-                    "⏰ 检测到云端处理超时（超过 10 分钟）。"
-                    "系统后台已自动重置该任务，请刷新页面或重新发起分析。"
-                )
-                st.session_state.is_running = False
-                st.rerun()
-
-    # 3 秒后自动重绘（Streamlit 标准轮询模式）
-    if st.session_state.is_running:
-        time.sleep(3)
-        st.rerun()
-
-# =========================================================================
-# 6. 结果渲染层
-# =========================================================================
-if st.session_state.task_error:
-    st.error(st.session_state.task_error)
-
-if st.session_state.task_result:
-    result = st.session_state.task_result
     st.markdown("---")
+    st.caption("💡 卡密请前往发卡网购买 | Key 在 platform.deepseek.com | 本站不储存任何 Key")
 
-    if result["mode"] == "analyze":
-        st.success("✅ 直播间分析完成！")
-        st.subheader("📝 富化话术结果")
 
-        result_text = result.get("result_text", "")
-        try:
-            items = json.loads(result_text) if isinstance(result_text, str) and result_text.strip().startswith("[") else []
-        except (json.JSONDecodeError, TypeError):
-            st.markdown(result_text)
-            items = []
-
-        if isinstance(items, list):
-            for item in items[:10]:
-                cid = item.get("chunk_id", f"chunk_{id(item)}")
-                with st.expander(f"{cid}"):
-                    st.markdown("**🎤 破冰:**\n" + str(item.get("icebreaker", "")))
-                    st.markdown("**🎯 痛点:**\n" + str(item.get("painpoint", "")))
-                    st.markdown("**💎 卖点:**\n" + str(item.get("mechanism", "")))
-                    st.markdown("**🔥 逼单:**\n" + str(item.get("close_order", "")))
-
-    elif result["mode"] == "rewrite":
-        data = result["data"]
-        st.success("✅ 爆款话术重写完成！")
-
-        if data.get("retrieved_references"):
-            st.subheader("📚 检索到的历史爆款参考")
-            refs = data["retrieved_references"]
-            rcols = st.columns(len(refs))
-            for i, ref in enumerate(refs):
-                with rcols[i]:
-                    st.metric(f"参考 #{i+1}", f"{ref['similarity']*100:.0f}%")
-                    st.caption(ref.get("sales_stage", ""))
-
-        st.subheader("📝 完整话术脚本")
-        script = data.get("rewritten_script", "")
-        st.markdown(script.replace("[", "\n\n**[").replace("]", "]** "))
-
-        sop = data.get("sop_timeline", [])
-        if sop:
-            st.subheader("⏱️ 秒级执行 SOP 仪表盘")
-            st.dataframe(
-                [{
-                    "时间": s.get("time_range", ""), "阶段": s.get("stage", ""),
-                    "主播动作": s.get("host_action", ""), "后台操作": s.get("operation_action", ""),
-                    "关键词": s.get("verbal_keywords", ""),
-                } for s in sop],
-                use_container_width=True,
-            )
-
-    # 导出
-    export_text = ""
-    if result["mode"] == "rewrite":
-        d = result["data"]
-        parts = [f"爆款话术 — {d.get('my_product','')} ({d.get('target_style','')})", "="*50, d.get("rewritten_script","")]
-        for s in d.get("sop_timeline", []):
-            parts.append(f"\n[{s.get('time_range','')}] {s.get('stage','')}\n  主播: {s.get('host_action','')}\n  操作: {s.get('operation_action','')}")
-        export_text = "\n".join(parts)
-    elif result["mode"] == "analyze":
-        export_text = result.get("result_text", "")
-
-    if export_text:
-        st.download_button(
-            "📥 一键下载话术文案 (TXT)", data=export_text,
-            file_name=f"爆款话术_{time.strftime('%Y%m%d_%H%M%S')}.txt",
-            mime="text/plain", use_container_width=True,
-        )
-
-    if st.button("🔄 开始新任务", use_container_width=True):
-        for k in ("task_result", "task_error", "is_running",
-                  "running_task_id", "running_mode", "poll_count"):
-            st.session_state[k] = None if k in ("task_result", "task_error",
-                                                  "running_task_id", "running_mode") else (False if k == "is_running" else 0)
-        st.rerun()
-
-st.markdown("---")
-st.caption("💡 卡密请前往发卡网购买 | DeepSeek Key 在 platform.deepseek.com | 本站不储存任何 Key")
+# =========================================================================
+# 路由
+# =========================================================================
+if not st.session_state["logged_in"]:
+    show_login_page()
+else:
+    show_main_app()
