@@ -306,7 +306,7 @@ def show_main_app():
                 if not ak:
                     st.error("❌ 请先在侧边栏配置 DeepSeek API Key！")
                 elif not is_vip and bal < 1:
-                    st.error(f"❌ 点数不足！重写需 1 点，当前 {bal} 点。")
+                    st.error(f"❌ 点数不足！重写需 1 点，当前 {bal} 点。请在左侧边栏兑换卡密。")
                 else:
                     with st.spinner("🔄 AI 正在重写中..."):
                         try:
