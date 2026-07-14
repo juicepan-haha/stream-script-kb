@@ -33,19 +33,39 @@ from supabase_client import supabase
 
 
 # =========================================================================
-# Supabase 状态写入（引用全局 supabase_client）
+# Supabase 状态写入（status 纯洁 FSM，result_text 载人话日志）
 # =========================================================================
 
-async def _update_task_status(task_id: str, status: str, result_text: str = ""):
-    """异步写 Supabase：更新 fish_box 表的状态和结果。"""
+# 节流：至少间隔此秒数才允许再次写 Supabase
+_THROTTLE_SEC = 5
+_last_supabase_write: dict[str, float] = {}
+
+
+async def _update_task_progress(task_id: str, status: str, detail: str):
+    """
+    核心原则:
+      - status: 永远是纯状态机值 (queued/processing/success/failed)
+      - detail: 人话进度日志，写入 result_text
+      - 节流保护: 同 task_id 至少间隔 _THROTTLE_SEC 才写一次
+    """
+    now = time.time()
+    last = _last_supabase_write.get(task_id, 0)
+    if now - last < _THROTTLE_SEC:
+        return  # 节流跳过
+    _last_supabase_write[task_id] = now
+
     try:
-        update_data = {"status": status}
-        if result_text:
-            update_data["result_text"] = result_text[:50000]  # 防呆截断
-        supabase.table("fish_box").update(update_data).eq("id", task_id).execute()
-        print(f"[Supabase] [{task_id}] → {status}")
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: supabase.table("fish_box").update({
+                "status": status,
+                "result_text": detail[:50000],
+            }).eq("id", task_id).execute(),
+        )
+        print(f"[Supabase] [{task_id}] status={status}")
     except Exception as e:
-        print(f"[Supabase] [{task_id}] ⚠️ 状态更新失败: {e}")
+        print(f"[Supabase] [{task_id}] ⚠️ 写入失败: {e}")
 
 # =========================================================================
 # 内存传送带（背压防御：逐级 maxsize）
@@ -648,7 +668,7 @@ async def start_analysis(
 ):
     """
     Supabase 云版接口：前端先在 fish_box INSERT → 获得 task_id，
-    然后调用此接口。后端立即返回 queued，后台异步处理。
+    然后调用此接口。后端 0ms 返回 queued，后台异步处理。
     """
     # 1. 卡密校验
     if not await verify_card_code(card_code):
@@ -656,7 +676,7 @@ async def start_analysis(
     if not user_deepseek_key or not user_deepseek_key.startswith("sk-"):
         return {"status": "error", "message": "❌ DeepSeek API Key 格式无效！"}
 
-    # 2. 立即返回，前端不转圈
+    # 2. 立即返回，前端不转圈（BackgroundTasks 管理生命周期）
     asyncio.create_task(_run_pipeline(
         task_id, video_url, user_deepseek_key,
     ))
@@ -665,54 +685,57 @@ async def start_analysis(
 
 
 # =========================================================================
-# 管道编排器：分阶段执行 + 逐阶段写 Supabase
+# 管道编排器：分阶段执行 + 节流写 Supabase
 # =========================================================================
 
 async def _run_pipeline(task_id: str, url: str, user_key: str):
     """
-    后台协程 — 完整 4 阶段管道：
-      Stage 1: 下载 → Stage 2: 转录 → Stage 3: 切块 → Stage 4: 富化
-    每阶段完成后写入 Supabase，前端实时看到进度。
-    零阻塞前端，全异常捕获，status 实时落库。
+    后台协程 — 完整 4 阶段管道。
+    status 永远纯洁 (queued/processing/success/failed)，
+    人话日志写入 result_text，前端用 status === 'processing' 即可判断。
     """
     print(f"[Pipeline] [{task_id}] 启动: {url}")
 
     try:
         # ---- Stage 1: 下载 + 解码 ----
-        await _update_task_status(task_id, "processing",
-                                   "正在从直播源下载音频流...")
+        await _update_task_progress(task_id, "processing",
+                                     "正在从直播源下载音频流并解码...")
         await download_queue.put({
             "task_id": task_id, "url": url, "user_key": user_key,
         })
 
-        # ---- Stage 2: 等待转录有产出 ----
-        await _wait_for_condition(
-            task_id,
-            condition=lambda: (
-                task_id in transcript_results and
-                len(transcript_results[task_id]) > 0
-            ),
-            timeout_min=60,
-            status_msg="正在 GPU 转录音频为文字...",
-        )
+        # ---- Stage 2: 等待转录输出 ----
+        while True:
+            segs = len(transcript_results.get(task_id, []))
+            if segs > 0:
+                # 有转录段产出 → 下载阶段已过，可以进入下一阶段
+                break
+            await asyncio.sleep(5)
 
-        # ---- Stage 3 & 4: 等待富化完成 ----
-        await _wait_for_condition(
-            task_id,
-            condition=lambda: (
-                task_progress.get(task_id, {}).get("stage") == "completed"
-            ),
-            timeout_min=60,
-            status_msg="AI 正在提炼话术并生成 SOP...",
-        )
+        # ---- Stage 3 & 4: 富化中，定期刷进度 ----
+        last_report = ""
+        while True:
+            if task_progress.get(task_id, {}).get("stage") == "completed":
+                break
+
+            segs = len(transcript_results.get(task_id, []))
+            chunks = len(enriched_results.get(task_id, []))
+            report = f"GPU转录中 (已转录 {segs} 段) | AI提炼中 (已富化 {chunks} 块)"
+
+            # 只在内容变化时写（节流在 _update_task_progress 里保证 >=5秒）
+            if report != last_report:
+                await _update_task_progress(task_id, "processing", report)
+                last_report = report
+
+            await asyncio.sleep(5)
 
         # ---- 成功 ----
         enriched = enriched_results.get(task_id, [])
         if enriched:
             result_json = json.dumps(enriched, ensure_ascii=False, indent=2)
-            await _update_task_status(task_id, "success", result_json)
+            await _update_task_progress(task_id, "success", result_json)
         else:
-            await _update_task_status(
+            await _update_task_progress(
                 task_id, "success",
                 "分析完成，但未提取到有效话术（可能为纯音乐/静音）",
             )
@@ -720,39 +743,8 @@ async def _run_pipeline(task_id: str, url: str, user_key: str):
 
     except Exception as e:
         friendly_msg = _wrap_error_for_user(e)
-        await _update_task_status(task_id, "failed", friendly_msg)
+        await _update_task_progress(task_id, "failed", friendly_msg)
         print(f"[Pipeline] [{task_id}] ❌ {friendly_msg}")
-
-
-async def _wait_for_condition(
-    task_id: str,
-    condition,
-    timeout_min: int,
-    status_msg: str,
-    poll_interval: int = 5,
-):
-    """通用轮询器：每隔 poll_interval 检查 condition，满足后返回。"""
-    # 周期性更新 status_msg（附带进度信息）
-    last_update = 0
-    deadline = time.time() + timeout_min * 60
-
-    while time.time() < deadline:
-        if condition():
-            return
-
-        now = time.time()
-        if now - last_update > 30:  # 每 30 秒刷新一次 Supabase 状态
-            segs = len(transcript_results.get(task_id, []))
-            chunks = len(enriched_results.get(task_id, []))
-            await _update_task_status(
-                task_id, "processing",
-                f"{status_msg} (已转录 {segs} 段, 已富化 {chunks} 块)",
-            )
-            last_update = now
-
-        await asyncio.sleep(poll_interval)
-
-    raise TimeoutError(f"{status_msg} 超时 ({timeout_min} 分钟)")
 
 
 def _wrap_error_for_user(e: Exception) -> str:
