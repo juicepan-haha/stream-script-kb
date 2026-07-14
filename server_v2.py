@@ -33,39 +33,44 @@ from supabase_client import supabase
 
 
 # =========================================================================
-# Supabase 状态写入（status 纯洁 FSM，result_text 载人话日志）
+# 节流进度更新器（status 纯洁 FSM，result_text 载人话日志）
 # =========================================================================
 
-# 节流：至少间隔此秒数才允许再次写 Supabase
-_THROTTLE_SEC = 5
-_last_supabase_write: dict[str, float] = {}
-
-
-async def _update_task_progress(task_id: str, status: str, detail: str):
+class ThrottledProgressUpdater:
     """
-    核心原则:
-      - status: 永远是纯状态机值 (queued/processing/success/failed)
-      - detail: 人话进度日志，写入 result_text
-      - 节流保护: 同 task_id 至少间隔 _THROTTLE_SEC 才写一次
+    优雅节流：常规进度 >=5 秒写一次，成功/失败 force=True 立刻写入。
+    status 永远是纯状态机值，人话日志写入 result_text。
     """
-    now = time.time()
-    last = _last_supabase_write.get(task_id, 0)
-    if now - last < _THROTTLE_SEC:
-        return  # 节流跳过
-    _last_supabase_write[task_id] = now
 
-    try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None,
-            lambda: supabase.table("fish_box").update({
-                "status": status,
-                "result_text": detail[:50000],
-            }).eq("id", task_id).execute(),
-        )
-        print(f"[Supabase] [{task_id}] status={status}")
-    except Exception as e:
-        print(f"[Supabase] [{task_id}] ⚠️ 写入失败: {e}")
+    def __init__(self, task_id: str, min_interval: float = 5.0):
+        self.task_id = task_id
+        self.min_interval = min_interval
+        self.last_update: float = 0.0
+
+    async def update(self, status: str, detail: str, force: bool = False):
+        """
+        :param status: 纯状态机值 (processing/success/failed)
+        :param detail: 写入 result_text 的人话日志
+        :param force: True=绕过节流立刻写入 (用于 success/failed 最终态)
+        """
+        now = time.time()
+        if not force and (now - self.last_update < self.min_interval):
+            return  # 节流跳过
+
+        self.last_update = now
+
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: supabase.table("fish_box").update({
+                    "status": status,
+                    "result_text": detail[:50000],
+                }).eq("id", self.task_id).execute(),
+            )
+            print(f"[Supabase] [{self.task_id}] → {status}")
+        except Exception as e:
+            print(f"[Supabase] [{self.task_id}] ⚠️ 写入失败: {e}")
 
 # =========================================================================
 # 内存传送带（背压防御：逐级 maxsize）
@@ -685,34 +690,34 @@ async def start_analysis(
 
 
 # =========================================================================
-# 管道编排器：分阶段执行 + 节流写 Supabase
+# 管道编排器：分阶段执行 + 节流更新器 + force 最终态
 # =========================================================================
 
 async def _run_pipeline(task_id: str, url: str, user_key: str):
     """
     后台协程 — 完整 4 阶段管道。
-    status 永远纯洁 (queued/processing/success/failed)，
-    人话日志写入 result_text，前端用 status === 'processing' 即可判断。
+    updater.update("processing", ...) 自动节流 >=5 秒，
+    updater.update("success", ..., force=True) 立刻写入最终结果。
     """
+    updater = ThrottledProgressUpdater(task_id, min_interval=5.0)
     print(f"[Pipeline] [{task_id}] 启动: {url}")
 
     try:
         # ---- Stage 1: 下载 + 解码 ----
-        await _update_task_progress(task_id, "processing",
-                                     "正在从直播源下载音频流并解码...")
+        await updater.update("processing",
+                             "正在从直播源下载音频流并解码...", force=True)
         await download_queue.put({
             "task_id": task_id, "url": url, "user_key": user_key,
         })
 
-        # ---- Stage 2: 等待转录输出 ----
+        # ---- Stage 2: 等待转录有产出 ----
         while True:
             segs = len(transcript_results.get(task_id, []))
             if segs > 0:
-                # 有转录段产出 → 下载阶段已过，可以进入下一阶段
                 break
             await asyncio.sleep(5)
 
-        # ---- Stage 3 & 4: 富化中，定期刷进度 ----
+        # ---- Stage 3 & 4: 富化中，高频调用 updater 自动节流 ----
         last_report = ""
         while True:
             if task_progress.get(task_id, {}).get("stage") == "completed":
@@ -722,28 +727,27 @@ async def _run_pipeline(task_id: str, url: str, user_key: str):
             chunks = len(enriched_results.get(task_id, []))
             report = f"GPU转录中 (已转录 {segs} 段) | AI提炼中 (已富化 {chunks} 块)"
 
-            # 只在内容变化时写（节流在 _update_task_progress 里保证 >=5秒）
             if report != last_report:
-                await _update_task_progress(task_id, "processing", report)
+                # 高频调用也没事，updater 内部节流 >=5 秒
+                await updater.update("processing", report)
                 last_report = report
 
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
-        # ---- 成功 ----
+        # ---- 成功：force=True 立刻写入，绕过节流 ----
         enriched = enriched_results.get(task_id, [])
         if enriched:
             result_json = json.dumps(enriched, ensure_ascii=False, indent=2)
-            await _update_task_progress(task_id, "success", result_json)
+            await updater.update("success", result_json, force=True)
         else:
-            await _update_task_progress(
-                task_id, "success",
-                "分析完成，但未提取到有效话术（可能为纯音乐/静音）",
-            )
+            await updater.update("success",
+                                 "分析完成，但未提取到有效话术",
+                                 force=True)
         print(f"[Pipeline] [{task_id}] ✅ ({len(enriched)} chunks)")
 
     except Exception as e:
         friendly_msg = _wrap_error_for_user(e)
-        await _update_task_progress(task_id, "failed", friendly_msg)
+        await updater.update("failed", friendly_msg, force=True)
         print(f"[Pipeline] [{task_id}] ❌ {friendly_msg}")
 
 
