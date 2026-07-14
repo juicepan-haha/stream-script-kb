@@ -338,7 +338,7 @@ def page_login():
 if not st.session_state.get("logged_in"):
     page_login()
 else:
-    pg1 = st.Page(page_ingestion, title="📥 数据采集入库", icon="📥")
-    pg2 = st.Page(page_knowledge_base, title="🔍 直播话术知识库", icon="🔍")
+    pg1 = st.Page(page_ingestion, title="数据采集入库", icon="📥")
+    pg2 = st.Page(page_knowledge_base, title="直播话术知识库", icon="🔍")
     pg = st.navigation([pg1, pg2])
     pg.run()
