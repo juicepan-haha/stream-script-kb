@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ffmpeg (for step0 audio download)
 - CUDA-capable GPU optional (Whisper falls back to CPU)
 
-**Before first run**, edit `config.py` and change `CHUNK_DIR` from `/home/justin/audio_chunks` to a path on your machine. Also set environment variables: `DEEPSEEK_API_KEY`, `PG_HOST`, `PG_PORT`, `PG_USER`, `PG_PASSWORD`, `PG_DB`.
+**Before first run**, review `shared/config.py` and set environment variables: `DEEPSEEK_API_KEY`, `PG_HOST`, `PG_PORT`, `PG_USER`, `PG_PASSWORD`, `PG_DB`.
 
 ## Commands
 
@@ -22,18 +22,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 pip install -r requirements.txt
 
 # Run the full pipeline (sequential, each step reads the prior step's output)
-python step0_download.py --url "..." --name "主播名_20260712"       # ffmpeg → audio_chunks/*.m4a
-python step0_download.py --batch data/stream_urls.json --duration 3600  # batch mode
-python step1_transcribe.py   # .m4a → data/transcripts/*.vtt (faster-whisper, skips existing)
-python step2_chunk.py        # .vtt → data/chunks.json (500-1000 char chunks)
-python step3_deepseek.py [--limit N]  # chunks.json → data/enriched.json + data/errors.log
-python step4_vectorize.py    # enriched.json → PostgreSQL scripts table + HNSW index
+python3 -m pipeline.step0_download --url "..." --name "主播名_20260712"
+python3 -m pipeline.step1_transcribe   # .m4a → data/transcripts/*.vtt
+python3 -m pipeline.step2_chunk        # .vtt → data/chunks.json
+python3 -m pipeline.step3_deepseek --limit N
+python3 -m pipeline.step4_vectorize    # enriched.json → PostgreSQL + pgvector
 
 # Run the search UI
-streamlit run app.py
+python3 -m streamlit run web/app.py
+
+# Run the streaming API
+python3 -m streaming.server
 
 # Run tests
-python -m pytest tests/ -v
+python3 -m pytest tests/ -v
 ```
 
 ## Architecture
@@ -45,7 +47,7 @@ m3u8/直播URL  →  step0 (ffmpeg download)  →  audio_chunks/*.m4a
   → step2 (char-based chunking at sentence boundaries)  →  data/chunks.json
   → step3 (DeepSeek async enrichment)  →  data/enriched.json + data/errors.log
   → step4 (bge embedding + pgvector)  →  PostgreSQL scripts table
-  → app.py (Streamlit)  →  browser
+  → web/app.py (Streamlit)  →  browser
 ```
 
 Each step is an independent script. Intermediate results are persisted to disk, so failed steps can be re-run without redoing earlier work. Step 1 supports resume (skips existing VTT files). Step 3 supports `--limit N` for testing on a subset.
@@ -56,18 +58,19 @@ Each step is an independent script. Intermediate results are persisted to disk, 
 
 **Streamlit app** uses `@st.cache_resource` for the embedding model and DB connection, `@st.cache_data(ttl=300)` for filter dropdowns. Search uses pgvector's cosine distance operator `<=>` with optional faceted filters (source, sales stage, strategy type, product).
 
+**Streaming API** is assembled in `streaming/server.py`. Shared queues and results live in `streaming/state.py`; HTTP endpoints live in `streaming/routes/`; the four queue-connected workers live in `streaming/workers/`; RAG retrieval and rewriting live in `streaming/services/rag.py`. Transient analysis results stay in memory, while the RAG rewrite endpoint reads the PostgreSQL knowledge base created by the offline pipeline.
+
 ## Key Design Decisions
 
 - **Chinese-language pipeline throughout** (Whisper `language=zh`, bge-small-zh-v1.5, DeepSeek with Chinese prompts)
 - **pgvector over Milvus** (current data volume is small enough)
-- **No real-time ingestion**, no VAD/audio preprocessing, no multi-user/auth
+- **Two explicit processing modes**: file-backed offline ingestion and queue-backed real-time analysis
 - **500-1000 character chunking** at sentence boundaries (句末标点 `。！？.!?`), hard-split on oversize entries, short tails merged into previous chunk
-- **JSON arrays stored as JSON strings** in PostgreSQL (`strategy_types`, `product_mentions`, `selling_points`). Faceted filtering uses `LIKE %value%` — this is simple but fragile: substring matches mean "刀" would match "剪刀". Acceptable for current data volume; switch to `jsonb` with `?` / `@>` operators if this causes problems.
+- **JSON arrays stored as JSONB** in PostgreSQL (`strategy_types`, `product_mentions`, `selling_points`). Faceted filtering uses native JSONB containment queries.
 
 ## Known Limitations
 
-- `config.CHUNK_DIR` is hardcoded to `/home/justin/audio_chunks` — must be changed per-machine
 - `streamlink` is listed in `requirements.txt` but unused by any pipeline step (only `experiments/test_ytdlp.py` explores alternative download approaches)
 - Step 0 and step 1 are single-file-at-a-time; no parallel processing within each step
-- No incremental update mechanism — re-running step4 re-inserts all records (no upsert/merge)
+- The real-time analysis result store is process memory only and is lost on service restart
 - Test coverage is minimal: only step2 chunking logic and step4 DB config presence

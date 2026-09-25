@@ -1,10 +1,10 @@
-"""Tests for step4_vectorize.py"""
-from step4_vectorize import DB_CONFIG
+"""Tests for the vectorization database configuration."""
+from shared import config
 
 
 def test_db_config_present():
     """数据库配置项存在且非空。"""
-    assert DB_CONFIG["host"] is not None
-    assert DB_CONFIG["port"] is not None
-    assert DB_CONFIG["dbname"] is not None
-    assert len(DB_CONFIG["dbname"]) > 0
+    assert config.PG_HOST is not None
+    assert config.PG_PORT is not None
+    assert config.PG_DB is not None
+    assert len(config.PG_DB) > 0

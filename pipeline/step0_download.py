@@ -16,7 +16,7 @@ from pathlib import Path
 
 import requests
 
-import config
+from shared import config
 
 # CDN 并发上限，避免触发反爬
 MAX_WORKERS = 16

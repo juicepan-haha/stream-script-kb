@@ -14,7 +14,7 @@ from datetime import datetime
 import aiofiles
 from openai import AsyncOpenAI
 
-import config
+from shared import config
 
 # --- 动态提取校验关键词 ---
 

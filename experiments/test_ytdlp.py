@@ -3,13 +3,13 @@
 
 用法:
   # 查看 URL 信息和可用格式（不下载）
-  python experiments/test_ytdlp.py --url "https://..." --dry-run
+  python3 -m experiments.test_ytdlp --url "https://..." --dry-run
 
   # 下载音频
-  python experiments/test_ytdlp.py --url "https://..."
+  python3 -m experiments.test_ytdlp --url "https://..."
 
   # 指定输出目录和文件名
-  python experiments/test_ytdlp.py --url "https://..." --output-dir /tmp --name test_001
+  python3 -m experiments.test_ytdlp --url "https://..." --output-dir /tmp --name test_001
 
 前置:
   pip install yt-dlp
@@ -23,7 +23,7 @@ from pathlib import Path
 
 # 尝试引入项目配置（可选，不强制）
 try:
-    import config
+    from shared import config
     DEFAULT_OUTPUT_DIR = config.CHUNK_DIR
 except ImportError:
     DEFAULT_OUTPUT_DIR = Path("./downloads")
@@ -224,7 +224,7 @@ def main():
         print(f"📂 保存位置: {output_path.resolve()}")
         print(f"\n💡 下一步: 运行管道处理此文件")
         print(f"   cp '{output_path}' ~/stream-script-kb/audio_chunks/")
-        print(f"   cd ~/stream-script-kb && python step1_transcribe.py")
+        print("   python3 -m pipeline.step1_transcribe")
     else:
         sys.exit(1)
 

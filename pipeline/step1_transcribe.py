@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-import config
+from shared import config
 
 
 def _format_vtt(segments, offset_seconds: float = 0.0) -> str:
@@ -241,7 +241,7 @@ def main():
     print(f"[STEP1] Found {total_files} .m4a file(s)")
 
     if total_files == 0:
-        print("[STEP1] No .m4a files found. Run step0_download.py first.")
+        print("[STEP1] No .m4a files found. Run python3 -m pipeline.step0_download first.")
         return
 
     # --- 加载模型（只一次）---

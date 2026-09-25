@@ -8,7 +8,7 @@ import json
 import re
 from pathlib import Path
 
-import config
+from shared import config
 
 
 _SENTENCE_END = re.compile(r"[。！？.!?]$")
@@ -169,7 +169,7 @@ def main():
     print(f"[STEP2] Found {total} VTT files")
 
     if total == 0:
-        print("[STEP2] No VTT files found. Run step1_transcribe.py first.")
+        print("[STEP2] No VTT files found. Run python3 -m pipeline.step1_transcribe first.")
         return
 
     all_chunks = []

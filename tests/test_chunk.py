@@ -1,5 +1,5 @@
-"""Tests for step2_chunk.py"""
-from step2_chunk import parse_vtt, build_chunks
+"""Tests for pipeline.step2_chunk."""
+from pipeline.step2_chunk import build_chunks, parse_vtt
 
 
 def test_parse_vtt_single_entry():

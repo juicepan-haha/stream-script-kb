@@ -6,23 +6,23 @@
 
 ## 架构
 
-5 个独立脚本 + 1 个 Streamlit 应用，顺序执行，中间结果落文件。
+离线处理由 `pipeline/` 下的 5 个独立模块顺序执行，中间结果落文件；实时处理由 `streaming/server.py` 装配，队列状态、路由、Worker 和 RAG 服务分别位于 `streaming/state.py`、`streaming/routes/`、`streaming/workers/` 和 `streaming/services/`。
 
 ```
 audio_chunks/*.m4a
-    │  step1_transcribe.py (faster-whisper, CUDA)
+    │  pipeline.step1_transcribe (faster-whisper, CUDA)
     ▼
 data/transcripts/*.vtt
-    │  step2_chunk.py (按字数切块, 500-1000字)
+    │  pipeline.step2_chunk (按字数切块, 500-1000字)
     ▼
 data/chunks.json
-    │  step3_deepseek.py (DeepSeek API 并发, asyncio)
+    │  pipeline.step3_deepseek (DeepSeek API 并发, asyncio)
     ▼
 data/enriched.json + data/errors.log
-    │  step4_vectorize.py (bge-small-zh-v1.5 → pgvector)
+    │  pipeline.step4_vectorize (bge-small-zh-v1.5 → pgvector)
     ▼
 PostgreSQL (scripts 表 + HNSW 索引)
-    │  app.py (Streamlit)
+    │  web/app.py (Streamlit)
     ▼
 浏览器 (筛选 + 语义搜索 + 卡片展示)
 ```
@@ -87,7 +87,7 @@ PostgreSQL (scripts 表 + HNSW 索引)
 
 ## 配置
 
-所有可调参数集中在 `config.py`: 路径、模型名、API key、并发数、DB 连接信息、切块字数阈值。
+所有可调参数集中在 `shared/config.py`: 路径、模型名、API key、并发数、DB 连接信息、切块字数阈值。
 
 ## 错误处理
 

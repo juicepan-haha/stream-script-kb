@@ -1,5 +1,7 @@
 # Stream Script KB 实现计划
 
+> 归档说明：本文记录项目最初的根目录布局。当前入口已经分别移动到 `pipeline/`、`streaming/` 和 `web/`，共享配置位于 `shared/config.py`；请以项目根目录的 `README.md` 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 构建直播话术知识库 — 从音频转录到语义搜索的完整管道

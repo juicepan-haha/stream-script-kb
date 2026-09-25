@@ -3,7 +3,8 @@ import os
 from pathlib import Path
 
 # --- 路径 ---
-BASE_DIR = Path(__file__).parent
+# config.py 位于 shared/，项目数据仍统一存放在仓库根目录下。
+BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 CHUNK_DIR = BASE_DIR / "audio_chunks"
 TRANSCRIPT_DIR = DATA_DIR / "transcripts"

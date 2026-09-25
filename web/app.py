@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Streamlit 直播话术语义检索界面。
 
-用法: streamlit run app.py
+用法: python3 -m streamlit run web/app.py
 """
 # ⚠️ 必须在导入 sentence_transformers 之前设置，否则会卡在 HF 网络请求
 import os
@@ -17,7 +17,7 @@ import streamlit as st
 from pgvector.psycopg2 import register_vector
 from sentence_transformers import SentenceTransformer
 
-import config
+from shared import config
 
 # --- 页面配置 ---
 st.set_page_config(
@@ -86,7 +86,7 @@ def get_filter_options():
 try:
     sources, stages, strategies, products = get_filter_options()
 except Exception:
-    st.warning("⚠️ 无法连接数据库。请确认 PostgreSQL 已启动且 step4_vectorize.py 已执行。")
+    st.warning("⚠️ 无法连接数据库。请确认 PostgreSQL 已启动且离线向量入库步骤已执行。")
     st.stop()
 
 st.subheader("🔍 筛选条件")
@@ -243,4 +243,4 @@ else:
             "输入搜索词或点击搜索开始检索。"
         )
     except Exception:
-        st.info("📊 数据库暂无数据。请先运行 step4_vectorize.py 入库。")
+        st.info("📊 数据库暂无数据。请先运行 python3 -m pipeline.step4_vectorize 入库。")

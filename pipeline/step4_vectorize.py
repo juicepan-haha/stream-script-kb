@@ -19,7 +19,7 @@ from pgvector.psycopg2 import register_vector
 from psycopg2.extras import execute_values
 from sentence_transformers import SentenceTransformer
 
-import config
+from shared import config
 
 # ====== 配置 ======
 
@@ -205,7 +205,7 @@ def main():
     enriched_file = Path(config.ENRICHED_FILE)
     if not enriched_file.exists():
         print(f"[STEP4] ERROR: {config.ENRICHED_FILE} not found. "
-              f"Run step3_deepseek.py first.", file=sys.stderr)
+              f"Run python3 -m pipeline.step3_deepseek first.", file=sys.stderr)
         sys.exit(1)
 
     with open(enriched_file, "r", encoding="utf-8") as f:
@@ -215,7 +215,7 @@ def main():
     print(f"[STEP4] {total} records loaded")
 
     if total == 0:
-        print("[STEP4] No records. Run step3_deepseek.py first.")
+        print("[STEP4] No records. Run python3 -m pipeline.step3_deepseek first.")
         return
 
     init_schema()
